@@ -1,0 +1,6 @@
+- [Supabase migration target](supabase-migration-target.md) — verify the CLI project ID, runtime API URL, and direct database connection all refer to the approved project.
+- [Primary-model orchestration](adaptive-cognitive-orchestration.md) — keep ordinary replies on Muse Spark; invoke Gemini only from runtime recovery paths.
+- [Model reasoning visibility](model-reasoning-visibility.md) — display provider-emitted raw reasoning text when available; do not substitute a reasoning summary.
+- [Browser Use execution](browser-use-execution.md) — browser actions must use Browser Use Cloud directly, without requiring InstaVM or VM-installed Playwright.
+- [Chat task durability](chat-task-durability.md) — closing the app browser tab must not stop an active background task.
+- [Liquid glass UI consistency](liquid-glass-ui-consistency.md) — new interface components should use the app's existing liquid glass visual style.
