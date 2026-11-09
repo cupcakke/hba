@@ -78,7 +78,31 @@ def shell_quote(value: str) -> str:
     return "'" + value.replace("'", "'\\''") + "'"
 
 
+async def _private_address_async(host: str) -> bool:
+    normalized = host.lower()
+    if (
+        normalized == "localhost"
+        or normalized.endswith(".localhost")
+        or normalized.endswith(".local")
+        or normalized.endswith(".internal")
+        or normalized == "metadata.google.internal"
+    ):
+        return True
+    loop = asyncio.get_running_loop()
+    try:
+        infos = await asyncio.wait_for(
+            loop.getaddrinfo(normalized, None, proto=socket.IPPROTO_TCP), timeout=5.0
+        )
+    except (socket.gaierror, asyncio.TimeoutError):
+        return False
+    for info in infos:
+        address = info[4][0]
+        if _ip_is_private(address):
+            return True
+    return False
+
 def _private_address(host: str) -> bool:
+    # Synchronous fallback for non-async contexts (kept for compatibility)
     normalized = host.lower()
     if (
         normalized == "localhost"
@@ -89,6 +113,7 @@ def _private_address(host: str) -> bool:
     ):
         return True
     try:
+        # Use blocking call only for sync fallback; async path uses _private_address_async
         infos = socket.getaddrinfo(normalized, None, proto=socket.IPPROTO_TCP)
     except socket.gaierror:
         return False
@@ -169,11 +194,11 @@ async def validate_browser_url(
     hostname = (parsed.hostname or "").lower()
     if hostname not in allowed_hosts and not (allow_public_hosts and not allowed_hosts):
         raise RequestFault("Ez a böngésző URL nem engedélyezett.", code="NETWORK_DENIED", status_code=403)
-    if _private_address(hostname):
+    if await _private_address_async(hostname):
         raise RequestFault("Privát vagy nem feloldható böngésző cím.", code="NETWORK_DENIED", status_code=403)
     loop = asyncio.get_running_loop()
     try:
-        infos = await loop.getaddrinfo(hostname, 443, proto=socket.IPPROTO_TCP)
+        infos = await asyncio.wait_for(loop.getaddrinfo(hostname, 443, proto=socket.IPPROTO_TCP), timeout=5.0)
     except socket.gaierror as exc:
         raise ProviderFault(
             "DNS_RESOLUTION_FAILED",
@@ -269,13 +294,17 @@ class Sandbox:
         headers = {"X-API-Key": self._key}
         if body is not None:
             headers["Content-Type"] = "application/json"
+        if timeout is None:
+            request_timeout = httpx.USE_CLIENT_DEFAULT
+        else:
+            request_timeout = httpx.Timeout(timeout, connect=10.0)
         try:
             response = await self._client.request(
                 method,
                 f"{self._base_url}{path}",
                 headers=headers,
                 json=body,
-                timeout=httpx.Timeout(timeout, connect=10.0) if timeout else None,
+                timeout=request_timeout,
             )
         except httpx.TimeoutException as exc:
             raise UnknownOutcomeFault("A sandbox műveletének kimenetele ismeretlen.") from exc
@@ -394,7 +423,8 @@ class Sandbox:
 
     @staticmethod
     def _output_text(raw: dict[str, Any]) -> tuple[str, str]:
-        if raw.get("success") is False or raw.get("error") not in (None,):
+        err = raw.get("error")
+        if raw.get("success") is False or (err is not None and err):
             raise ProviderFault("PROVIDER_EXECUTION", "Az InstaVM végrehajtási hibát jelentett.")
         exit_code = raw.get("exit_code")
         if isinstance(exit_code, int) and exit_code != 0:

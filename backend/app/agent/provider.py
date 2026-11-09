@@ -27,11 +27,32 @@ MAX_SSE_EVENT_BYTES = 1_048_576
 MAX_OUTPUT_BYTES = 1_048_576
 MAX_TOOL_NAME_CHARS = 200
 MAX_TOOL_ARGUMENT_CHARS = 1_048_576
-MAX_CALLS_PER_STEP = 2
+MAX_CALLS_PER_STEP = 16
 MAX_UPSTREAM_RETRIES = 0
 MODEL_CONNECT_TIMEOUT_SECONDS = 120
 MODEL_IDLE_TIMEOUT_SECONDS = 180
 MODEL_MAX_OUTPUT_TOKENS = 27_000
+
+_shared_clients: dict[int, httpx.AsyncClient] = {}
+
+
+def _get_shared_client() -> httpx.AsyncClient:
+    loop = asyncio.get_running_loop()
+    loop_id = id(loop)
+    client = _shared_clients.get(loop_id)
+    if client is None or client.is_closed:
+        client = httpx.AsyncClient(
+            timeout=httpx.Timeout(
+                connect=MODEL_CONNECT_TIMEOUT_SECONDS,
+                read=MODEL_IDLE_TIMEOUT_SECONDS,
+                write=MODEL_CONNECT_TIMEOUT_SECONDS,
+                pool=MODEL_CONNECT_TIMEOUT_SECONDS,
+            ),
+            limits=httpx.Limits(max_connections=64, max_keepalive_connections=16),
+            follow_redirects=False,
+        )
+        _shared_clients[loop_id] = client
+    return client
 
 
 @dataclass
@@ -56,7 +77,7 @@ class ModelStream:
     touch: Any
     model: str = ""
     task_id: str = ""
-    purpose: str = "agent"
+    purpose: str = ""
     attempt: int = 1
 
 
@@ -80,7 +101,10 @@ async def await_with_cancel(awaitable: Awaitable[T], cancel: asyncio.Event) -> T
             if not pending_task.done():
                 pending_task.cancel()
         if waiter.done() and not waiter.cancelled():
-            waiter.exception()
+            try:
+                waiter.exception()
+            except Exception:
+                pass
 
 
 def _append_fragment(
@@ -160,83 +184,19 @@ def finalize_tool_call(builder: ToolCallBuilder) -> ToolCall:
         builder.argument_overflow,
         _parses_as_json,
     )
-    return ToolCall(
-        id=builder.id,
-        type="function",
-        function_name=name,
-        function_arguments=arguments if arguments else "{}",
-    )
+    try:
+        return ToolCall(
+            id=builder.id,
+            type="function",
+            function_name=name,
+            function_arguments=arguments if arguments else "{}",
+        )
+    except Exception as exc:
+        from pydantic import ValidationError
 
-
-def validate_tool_delta(choice: dict[str, Any], parts: dict[int, ToolCallBuilder]) -> None:
-    delta = choice.get("delta")
-    if not isinstance(delta, dict):
-        return
-    incoming = delta.get("tool_calls")
-    if incoming is None:
-        return
-    if not isinstance(incoming, list) or len(incoming) > MAX_CALLS_PER_STEP:
-        raise ProtocolFault("Érvénytelen eszközfragmentum lista.")
-    for item in incoming:
-        if not isinstance(item, dict):
-            raise ProtocolFault("Hiányzó vagy érvénytelen eszközindex.")
-        index = item.get("index")
-        if isinstance(index, bool) or not isinstance(index, int) or index < 0 or index >= MAX_CALLS_PER_STEP:
-            raise ProtocolFault("Hiányzó vagy érvénytelen eszközindex.")
-        previous = parts.get(index)
-        if previous is None:
-            previous = ToolCallBuilder()
-        item_type = item.get("type")
-        if item_type is not None and item_type != "function":
-            raise ProtocolFault("Nem támogatott eszköztípus.")
-        item_id = item.get("id")
-        if item_id is not None:
-            if not isinstance(item_id, str) or not item_id or (previous.id and previous.id != item_id):
-                raise ProtocolFault("Ütköző vagy hiányos eszközazonosító.")
-            previous.id = item_id
-        function = item.get("function")
-        if function is not None:
-            if not isinstance(function, dict):
-                raise ProtocolFault("Hibás függvényfragmentum.")
-            name = function.get("name")
-            if name is not None:
-                if not isinstance(name, str):
-                    raise ProtocolFault("Hibás eszköznév.")
-                (
-                    previous.name,
-                    previous.name_snapshot,
-                    previous.name_parts,
-                    previous.name_snapshot_valid,
-                    previous.name_overflow,
-                ) = _append_fragment(
-                    previous.name,
-                    previous.name_snapshot,
-                    previous.name_parts,
-                    previous.name_snapshot_valid,
-                    previous.name_overflow,
-                    name,
-                    MAX_TOOL_NAME_CHARS,
-                )
-            arguments = function.get("arguments")
-            if arguments is not None:
-                if not isinstance(arguments, str):
-                    raise ProtocolFault("Hibás argumentumfragmentum.")
-                (
-                    previous.arguments,
-                    previous.argument_snapshot,
-                    previous.argument_parts,
-                    previous.argument_snapshot_valid,
-                    previous.argument_overflow,
-                ) = _append_fragment(
-                    previous.arguments,
-                    previous.argument_snapshot,
-                    previous.argument_parts,
-                    previous.argument_snapshot_valid,
-                    previous.argument_overflow,
-                    arguments,
-                    MAX_TOOL_ARGUMENT_CHARS,
-                )
-        parts[index] = previous
+        if isinstance(exc, ValidationError):
+            raise ProtocolFault(f"Érvénytelen eszközhívás: {exc}", code="MODEL_PROTOCOL") from exc
+        raise
 
 
 async def parse_sse(
@@ -293,7 +253,7 @@ async def parse_sse(
             ) from exc
         if leading:
             leading = False
-            if buffer.startswith("﻿"):
+            if buffer.startswith("\ufeff"):
                 buffer = buffer[1:]
         if len(buffer) > MAX_SSE_EVENT_BYTES and "\n" not in buffer and "\r" not in buffer:
             raise ProtocolFault("Túl hosszú SSE sor.", code="STREAM_TOO_LARGE")
@@ -341,9 +301,9 @@ def retry_delay(response: httpx.Response | None, attempt: int) -> float:
                 try:
                     parsed = parsedate_to_datetime(header)
                     if parsed is not None:
-                        import time
+                        import time as _time
 
-                        wait = max(0.0, parsed.timestamp() * 1000 - time.time() * 1000)
+                        wait = max(0.0, parsed.timestamp() * 1000 - _time.time() * 1000)
                 except (TypeError, ValueError):
                     wait = -1.0
     if wait < 0:
@@ -543,6 +503,17 @@ def _response_usage(value: Any) -> dict[str, Any] | None:
     return usage
 
 
+def _select_reasoning_effort(purpose: str, escalated: bool = False) -> str:
+    from app.config import get_settings
+
+    settings = get_settings()
+    if escalated:
+        return settings.model_reasoning_effort_escalated
+    if purpose != "agent_step":
+        return settings.model_reasoning_effort_cognitive
+    return settings.model_reasoning_effort
+
+
 async def call_model(
     config: RuntimeConfig,
     messages: list[dict[str, Any]],
@@ -551,11 +522,14 @@ async def call_model(
     deadline: float,
     *,
     task_id: str = "",
-    purpose: str = "agent",
+    purpose: str = "agent_step",
+    escalated: bool = False,
 ) -> ModelStream:
     from app.config import get_settings
 
     settings = get_settings()
+    effort = _select_reasoning_effort(purpose, escalated)
+    summary_mode = settings.model_reasoning_summary or "detailed"
     payload = {
         "model": settings.model_name,
         "input": _responses_input(messages),
@@ -563,26 +537,20 @@ async def call_model(
         "temperature": 1,
         "max_output_tokens": MODEL_MAX_OUTPUT_TOKENS,
         "top_p": 1,
-        "reasoning": {"effort": "xhigh", "summary": "detailed"},
+        "reasoning": {"effort": effort, "summary": summary_mode},
         "tools": _responses_tools(tools),
     }
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    client = httpx.AsyncClient(
-        timeout=httpx.Timeout(
-            connect=MODEL_CONNECT_TIMEOUT_SECONDS,
-            read=MODEL_IDLE_TIMEOUT_SECONDS,
-            write=MODEL_CONNECT_TIMEOUT_SECONDS,
-            pool=MODEL_CONNECT_TIMEOUT_SECONDS,
-        ),
-        follow_redirects=False,
+    logger.info(
+        "model_reasoning_effort_selected",
+        extra={"job_id": task_id, "purpose": purpose, "effort": effort, "escalated": escalated},
     )
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    client = _get_shared_client()
     for attempt in range(MAX_UPSTREAM_RETRIES + 1):
         attempt_started = time.monotonic()
         if cancel.is_set():
-            await client.aclose()
             raise AgentFault("CANCELLED", "A feladat megszakadt.", 499)
         if deadline - _now() <= 0:
-            await client.aclose()
             raise RuntimeLimitFault()
         request = client.build_request(
             "POST",
@@ -610,7 +578,6 @@ async def call_model(
         try:
             response = await client.send(request, stream=True)
         except httpx.TimeoutException as exc:
-            await client.aclose()
             logger.warning(
                 "model_request_failed",
                 extra={
@@ -627,7 +594,6 @@ async def call_model(
                 continue
             raise ProviderFault("MODEL_TIMEOUT", "A modell nem válaszolt időben.", 504) from exc
         except httpx.HTTPError as exc:
-            await client.aclose()
             if cancel.is_set():
                 raise AgentFault("CANCELLED", "A feladat megszakadt.", 499) from exc
             logger.warning(
@@ -661,7 +627,6 @@ async def call_model(
             content_type = response.headers.get("content-type", "")
             if "text/event-stream" not in content_type.lower():
                 await response.aclose()
-                await client.aclose()
                 raise ProtocolFault("A modell nem SSE adatfolyamot adott vissza.")
             return ModelStream(
                 response=response,
@@ -679,10 +644,8 @@ async def call_model(
         finally:
             await response.aclose()
         if status in (401, 403):
-            await client.aclose()
             raise ProviderFault("MODEL_AUTH", "Érvénytelen modell jogosultság.")
         if status == 402:
-            await client.aclose()
             raise ProviderFault(
                 "MODEL_PAYMENT_REQUIRED",
                 "A fő modell API HTTP 402 (Payment Required) választ adott. Ellenőrizd a "
@@ -690,12 +653,10 @@ async def call_model(
                 502,
             )
         if not retryable or attempt >= MAX_UPSTREAM_RETRIES:
-            await client.aclose()
             if status == 429:
                 raise ProviderFault("MODEL_RATE_LIMIT", f"A modell HTTP {status} hibát adott.")
             raise ProviderFault("MODEL_HTTP", f"A modell HTTP {status} hibát adott.")
         await asyncio.sleep(retry_delay(response, attempt))
-    await client.aclose()
     raise ProviderFault("MODEL_RETRIES_EXHAUSTED", "Elfogyott a modell újrapróbálkozási kerete.")
 
 
@@ -713,6 +674,10 @@ async def receive_model(
     content_bytes = 0
     usage: dict[str, Any] | None = None
     tool_items: dict[str, ToolCallBuilder] = {}
+    # Track emitted offsets per (output_index, summary_index) for summary deltas
+    emitted_summary_offsets: dict[tuple[int, int], int] = {}
+    # Track summary parts for joining
+    summary_parts: list[str] = []
 
     def store_function_call(item: Any, final: bool = False) -> None:
         if not isinstance(item, dict) or item.get("type") != "function_call":
@@ -824,6 +789,18 @@ async def receive_model(
                 }
             )
 
+    async def emit_draft(text: str) -> None:
+        if text:
+            await send(
+                {
+                    "type": "delta",
+                    "task_id": task_id,
+                    "step": step,
+                    "content": text,
+                    "draft": True,
+                }
+            )
+
     try:
         async for data in parse_sse(stream.response.aiter_bytes(), cancel, stream.touch):
             if data == "[DONE]":
@@ -840,7 +817,18 @@ async def receive_model(
             if not isinstance(event_type, str):
                 raise ProtocolFault("Hiányzik a Meta Responses eseménytípusa.")
             if event_type in ("error", "response.failed"):
-                raise ProviderFault("MODEL_ERROR", "A fő modell hibát jelzett.", 502)
+                error_obj = event.get("error") if isinstance(event.get("error"), dict) else {}
+                code = error_obj.get("code") if isinstance(error_obj, dict) else None
+                msg = error_obj.get("message") if isinstance(error_obj, dict) else None
+                logger.warning(
+                    "model_error_event",
+                    extra={
+                        "job_id": task_id,
+                        "error_code": code,
+                        "error_message": (str(msg)[:200] if msg else ""),
+                    },
+                )
+                raise ProviderFault("MODEL_ERROR", f"A fő modell hibát jelzett: {msg or code or 'ismeretlen'}", 502)
             if event_type == "response.incomplete":
                 response = event.get("response")
                 details = response.get("incomplete_details") if isinstance(response, dict) else None
@@ -861,27 +849,45 @@ async def receive_model(
                 if content_bytes > MAX_OUTPUT_BYTES:
                     raise ProviderFault("MODEL_OUTPUT_LIMIT", "A modell kimenete túl hosszú.")
                 if delta:
-                    await send(
-                        {
-                            "type": "delta",
-                            "task_id": task_id,
-                            "step": step,
-                            "content": delta,
-                        }
-                    )
+                    await emit_draft(delta)
                 continue
             if event_type == "response.reasoning_summary_text.delta":
                 delta = event.get("delta")
                 if not isinstance(delta, str):
                     raise ProtocolFault("Érvénytelen modell-összefoglaló.")
                 if delta:
+                    # track offsets per indices if present
+                    out_idx = event.get("output_index", 0)
+                    sum_idx = event.get("summary_index", 0)
+                    try:
+                        out_idx = int(out_idx)
+                        sum_idx = int(sum_idx)
+                    except Exception:
+                        out_idx, sum_idx = 0, 0
+                    key = (out_idx, sum_idx)
+                    prev = emitted_summary_offsets.get(key, 0)
+                    # emit delta immediately
+                    await emit_reasoning(delta, "summary")
                     reasoning_summary_text += delta
+                    emitted_summary_offsets[key] = prev + len(delta)
+                continue
+            if event_type in ("response.reasoning_summary_part.added", "response.reasoning_summary_part.done"):
+                part = event.get("part") if isinstance(event.get("part"), dict) else event
+                text = part.get("text") if isinstance(part, dict) else None
+                if isinstance(text, str) and text:
+                    # emit immediately with newline handling between parts
+                    if summary_parts:
+                        text = "\n\n" + text
+                    summary_parts.append(text)
+                    reasoning_summary_text += text
+                    await emit_reasoning(text, "summary")
                 continue
             if event_type == "response.reasoning_summary_text.done":
                 final_summary = event.get("text")
                 if not isinstance(final_summary, str):
                     final_summary = event.get("summary")
                 if isinstance(final_summary, str) and final_summary:
+                    # emit only suffix not yet emitted
                     if final_summary.startswith(reasoning_summary_text):
                         delta = final_summary[len(reasoning_summary_text) :]
                     elif not reasoning_summary_text:
@@ -889,6 +895,7 @@ async def receive_model(
                     else:
                         delta = ""
                     if delta:
+                        await emit_reasoning(delta, "summary")
                         reasoning_summary_text += delta
                 continue
             if event_type in (
@@ -920,6 +927,26 @@ async def receive_model(
                     if delta:
                         await emit_reasoning(delta, "raw")
                         reasoning_text += delta
+                continue
+            if event_type in ("response.web_search_call.in_progress", "response.web_search_call.searching"):
+                await send(
+                    {
+                        "type": "agent_event",
+                        "task_id": task_id,
+                        "step": step,
+                        "event": {"type": "tool_start", "tool": "web_search"},
+                    }
+                )
+                continue
+            if event_type == "response.web_search_call.completed":
+                await send(
+                    {
+                        "type": "agent_event",
+                        "task_id": task_id,
+                        "step": step,
+                        "event": {"type": "tool_result", "tool": "web_search", "output": event.get("output") or ""},
+                    }
+                )
                 continue
             if event_type == "response.output_item.added":
                 store_function_call(event.get("item"))
@@ -983,11 +1010,21 @@ async def receive_model(
                     if reasoning_delta:
                         await emit_reasoning(reasoning_delta, "raw")
                         reasoning_text += reasoning_delta
-                if not reasoning_text:
-                    summary_to_emit = final_summary or reasoning_summary_text
-                    if summary_to_emit:
-                        await emit_reasoning(summary_to_emit, "summary")
-                        reasoning_summary_text = summary_to_emit
+                # For summary, emit only suffix not yet emitted
+                if final_summary and final_summary != reasoning_summary_text:
+                    if final_summary.startswith(reasoning_summary_text):
+                        delta = final_summary[len(reasoning_summary_text) :]
+                    elif not reasoning_summary_text:
+                        delta = final_summary
+                    else:
+                        # suffix handling with parts joining
+                        delta = ""
+                        # if we have summary parts, try to detect missing
+                        if final_summary not in reasoning_summary_text:
+                            delta = final_summary[len(reasoning_summary_text):] if len(final_summary) > len(reasoning_summary_text) else ""
+                    if delta:
+                        await emit_reasoning(delta, "summary")
+                        reasoning_summary_text += delta
                 final_content = output_text(response)
                 if final_content and final_content != content:
                     if final_content.startswith(content):
@@ -997,16 +1034,13 @@ async def receive_model(
                         if content_bytes > MAX_OUTPUT_BYTES:
                             raise ProviderFault("MODEL_OUTPUT_LIMIT", "A modell kimenete túl hosszú.")
                         if delta:
-                            await send(
-                                {
-                                    "type": "delta",
-                                    "task_id": task_id,
-                                    "step": step,
-                                    "content": delta,
-                                }
-                            )
+                            await emit_draft(delta)
                     else:
-                        raise ProtocolFault("A modell végső szövege eltér az adatfolyamtól.")
+                        # reconcile: log and keep streamed text
+                        logger.warning(
+                            "model_final_text_mismatch",
+                            extra={"job_id": task_id, "streamed": len(content), "final": len(final_content)},
+                        )
                 usage = _response_usage(response.get("usage"))
                 completed = True
                 break
@@ -1034,13 +1068,26 @@ async def receive_model(
         )
         raise
     finally:
-        await stream.response.aclose()
-        await stream.client.aclose()
+        try:
+            await stream.response.aclose()
+        except Exception:
+            pass
+        # Do not close shared client; keep alive. Only close if it's a temporary client
+        # For shared client we keep it open. Detect if client is shared.
+        loop_id = id(asyncio.get_running_loop()) if asyncio.get_running_loop() else None
+        if loop_id is None or _shared_clients.get(loop_id) is not stream.client:
+            try:
+                await stream.client.aclose()
+            except Exception:
+                pass
     if not completed:
         raise ProtocolFault(
             "A modell adatfolyama nem fejeződött be szabályosan.", code="MODEL_INCOMPLETE"
         )
-    calls = [finalize_tool_call(builder) for builder in tool_items.values()]
+    try:
+        calls = [finalize_tool_call(builder) for builder in tool_items.values()]
+    except Exception as exc:
+        raise ProtocolFault(f"Érvénytelen eszközhívás: {exc}", code="MODEL_PROTOCOL") from exc
     if len(calls) > MAX_CALLS_PER_STEP:
         raise ProtocolFault("Túl sok modell eszközhívás.")
     if any(not call.id or not call.function_name for call in calls):
@@ -1066,4 +1113,11 @@ async def receive_model(
         },
     )
     finish = "tool_calls" if calls else "stop"
-    return ModelResponse(content=content, calls=calls, finish=finish, usage=usage)
+    try:
+        return ModelResponse(content=content, calls=calls, finish=finish, usage=usage)
+    except Exception as exc:
+        from pydantic import ValidationError
+
+        if isinstance(exc, ValidationError):
+            raise ProtocolFault(f"Érvénytelen modellválasz: {exc}", code="MODEL_PROTOCOL") from exc
+        raise

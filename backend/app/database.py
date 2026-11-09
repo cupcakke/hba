@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import random
+import asyncio
 from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import quote, urlparse
 
@@ -62,7 +64,24 @@ class Filter:
         if self.operator == "in":
             return {self.column: f"in.{encode_in_value(self.value)}"}
         if self.operator == "is":
-            return {self.column: f"is.{'null' if self.value is None else 'not.null'}"}
+            if self.value is None:
+                return {self.column: "is.null"}
+            if isinstance(self.value, bool):
+                return {self.column: f"is.{'true' if self.value else 'false'}"}
+            # Fallback for string values like "null", "true", "false"
+            text = str(self.value).lower()
+            if text in ("null", "true", "false"):
+                return {self.column: f"is.{text}"}
+            return {self.column: f"is.{encode_value(self.value)}"}
+        if self.operator == "not.is":
+            if self.value is None:
+                return {self.column: "not.is.null"}
+            if isinstance(self.value, bool):
+                return {self.column: f"not.is.{'true' if self.value else 'false'}"}
+            text = str(self.value).lower()
+            if text in ("null", "true", "false"):
+                return {self.column: f"not.is.{text}"}
+            return {self.column: f"not.is.{encode_value(self.value)}"}
         return {self.column: f"{self.operator}.{encode_value(self.value)}"}
 
 
@@ -107,7 +126,7 @@ class SupabaseDatabase:
         self._key = key
         self._headers = self._build_headers(key)
         self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(timeout, connect=10.0),
+            timeout=httpx.Timeout(15.0, connect=5.0, read=15.0, write=15.0, pool=5.0),
             limits=httpx.Limits(max_connections=64, max_keepalive_connections=16),
             follow_redirects=False,
         )
@@ -143,21 +162,42 @@ class SupabaseDatabase:
         if headers:
             request_headers.update(headers)
         url = f"{self._rest_url}/{path.lstrip('/')}"
-        request_timeout = httpx.Timeout(timeout, connect=10.0) if timeout else None
-        try:
-            response = await self._client.request(
-                method,
-                url,
-                params=dict(params) if params else None,
-                json=body,
-                headers=request_headers,
-                timeout=request_timeout,
-            )
-        except httpx.TimeoutException as exc:
-            raise DatabaseError(f"Az adatbázis kérés időtúllépett: {exc}", 504) from exc
-        except httpx.HTTPError as exc:
-            raise DatabaseError(f"Az adatbázis kérés nem sikerült: {exc}", 502) from exc
-        return self._parse(response)
+        if timeout is None:
+            request_timeout = httpx.USE_CLIENT_DEFAULT
+        else:
+            request_timeout = httpx.Timeout(timeout, connect=5.0, read=15.0, write=15.0, pool=5.0)
+        # retry logic for idempotent GET
+        max_retries = 2 if method == "GET" else 0
+        attempt = 0
+        while True:
+            try:
+                response = await self._client.request(
+                    method,
+                    url,
+                    params=dict(params) if params else None,
+                    json=body,
+                    headers=request_headers,
+                    timeout=request_timeout,
+                )
+            except httpx.TimeoutException as exc:
+                if attempt < max_retries:
+                    attempt += 1
+                    await asyncio.sleep(0.05 * attempt + random.random() * 0.1)
+                    continue
+                raise DatabaseError(f"Az adatbázis kérés időtúllépett: {exc}", 504) from exc
+            except httpx.HTTPError as exc:
+                # connection errors are retryable for GET
+                if attempt < max_retries:
+                    attempt += 1
+                    await asyncio.sleep(0.05 * attempt + random.random() * 0.1)
+                    continue
+                raise DatabaseError(f"Az adatbázis kérés nem sikerült: {exc}", 502) from exc
+            # check HTTP status codes for retry
+            if response.status_code in (502, 503, 504) and method == "GET" and attempt < max_retries:
+                attempt += 1
+                await asyncio.sleep(0.05 * attempt + random.random() * 0.1)
+                continue
+            return self._parse(response)
 
     @staticmethod
     def _parse(response: httpx.Response) -> DatabaseResponse:
@@ -221,8 +261,15 @@ class Table:
         self._body: Any = None
         self._prefer: str | None = None
         self._on_conflict: str | None = None
+        self._mutation = False
 
     def select(self, *columns: str, count: str | None = None, head: bool = False) -> "Table":
+        # If called after a mutation, only set select param, keep method/body
+        if self._mutation:
+            self._columns = ",".join(columns) if columns else "*"
+            self._count_mode = count
+            self._head = head
+            return self
         self._method = "GET"
         self._columns = ",".join(columns) if columns else "*"
         self._count_mode = count
@@ -233,6 +280,7 @@ class Table:
         self._method = "POST"
         self._body = payload
         self._prefer = "return=representation"
+        self._mutation = True
         return self
 
     def upsert(
@@ -244,19 +292,22 @@ class Table:
         self._method = "POST"
         self._body = payload
         self._on_conflict = on_conflict
-        resolution = "ignoreDuplicates" if ignore_duplicates else "mergeDuplicates"
+        resolution = "ignore-duplicates" if ignore_duplicates else "merge-duplicates"
         self._prefer = f"resolution={resolution},return=representation"
+        self._mutation = True
         return self
 
     def update(self, payload: Mapping[str, Any]) -> "Table":
         self._method = "PATCH"
         self._body = payload
         self._prefer = "return=representation"
+        self._mutation = True
         return self
 
     def delete(self) -> "Table":
         self._method = "DELETE"
         self._prefer = "return=representation"
+        self._mutation = True
         return self
 
     def eq(self, column: str, value: Any) -> "Table":
@@ -295,6 +346,10 @@ class Table:
         self._filters.append(Filter(column, "is", value))
         return self
 
+    def not_is(self, column: str, value: Any) -> "Table":
+        self._filters.append(Filter(column, "not.is", value))
+        return self
+
     def in_(self, column: str, values: Iterable[Any]) -> "Table":
         self._filters.append(Filter(column, "in", list(values)))
         return self
@@ -313,7 +368,7 @@ class Table:
 
     def range(self, start: int, end: int) -> "Table":
         self._offset = start
-        self._limit = max(0, end - start)
+        self._limit = max(0, end - start + 1)
         return self
 
     def _build_params(self) -> dict[str, str]:

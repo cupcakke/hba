@@ -21,6 +21,7 @@ from starlette.datastructures import FormData, UploadFile
 
 from app.config import get_settings
 from app.errors import RateLimitFault
+from app.utils.access import load_access
 from app.utils.rate_limit import client_key, rate_limiter
 from app.utils.security import verify_origin
 
@@ -1373,7 +1374,8 @@ def _options_payload() -> dict[str, Any]:
 @router.get("/api/images/options")
 async def get_image_options(request: Request) -> Any:
     try:
-        rate_limiter.check("list", client_key(request))
+        access = load_access(request)
+        rate_limiter.check("list", client_key(request, access.client_id))
         return _json(_options_payload())
     except RateLimitFault as exc:
         return _rate_limit_failure(exc)
@@ -1396,10 +1398,11 @@ async def post_image_edits(request: Request) -> Any:
 
 async def _handle_image_request(request: Request) -> Any:
     try:
+        access = load_access(request)
         origin_error = verify_origin(request)
         if origin_error is not None:
             return _failure(origin_error, 403, "INVALID_ORIGIN")
-        rate_limiter.check("images", client_key(request))
+        rate_limiter.check("images", client_key(request, access.client_id))
         payload = await _run_image_request(request)
         return _json(payload)
     except RateLimitFault as exc:

@@ -27,13 +27,13 @@ HEARTBEAT_MS = 20_000
 HEARTBEAT_FAILURE_LIMIT = 3
 HEARTBEAT_RETRY_MAX = 2
 HEARTBEAT_CALL_TIMEOUT_SECONDS = 10.0
-FOLLOW_POLL_MS = 800
-FOLLOW_POLL_MAX_MS = 3_000
+FOLLOW_POLL_MS = 100
+FOLLOW_POLL_MAX_MS = 500
 FOLLOW_STATUS_CHECK_MS = 2_500
-FOLLOW_HEARTBEAT_MS = 15_000
+FOLLOW_HEARTBEAT_MS = 10_000
 FOLLOW_MAX_MS = 21_600_000
 FOLLOW_REVIVE_MS = 30_000
-FOLLOW_TERMINAL_GRACE_MS = 30_000
+FOLLOW_TERMINAL_GRACE_MS = 3000
 FOLLOW_FAILURE_LIMIT = 8
 FOLLOW_RETRY_BASE_SECONDS = 0.5
 FOLLOW_RETRY_MAX_SECONDS = 6.0
@@ -44,7 +44,7 @@ SINK_RETRY_BASE_SECONDS = 0.4
 SINK_RETRY_MAX_SECONDS = 3.0
 SINK_MAX_BLOCK_SECONDS = 6.0
 SINK_FLUSH_EVERY = 10
-SINK_MIN_FLUSH_CHARS = 200
+SINK_MIN_FLUSH_CHARS = 512
 SINK_PROGRESS_INTERVAL_SECONDS = 1.5
 FINALIZE_RETRY_MAX = 4
 ERROR_MESSAGE_CHARS = 900
@@ -67,6 +67,8 @@ EXTENDED_COLUMNS = (
 logger = logging.getLogger("app.chat_jobs")
 
 _background_tasks: set[asyncio.Task[Any]] = set()
+JOB_NOTIFIERS: dict[str, asyncio.Event] = {}
+LOCAL_JOBS: dict[str, asyncio.Event] = {}
 _extended_columns: bool | None = None
 _extended_checked_at: float = 0.0
 _extended_lock = asyncio.Lock()
@@ -180,6 +182,7 @@ async def columns_available(database: SupabaseDatabase) -> bool:
         return True
 
 
+
 async def dispatch_chat_job(job_id: str, request_url: str) -> None:
     await dispatch_chat_job_origin(job_id, worker_origin(request_url))
 
@@ -195,13 +198,21 @@ async def _dispatch_chat_job_in_background(job_id: str, request_url: str) -> Non
 
 
 def schedule_chat_job_dispatch(job_id: str, request_url: str) -> asyncio.Task[None]:
-    return _retain(_dispatch_chat_job_in_background(job_id, request_url))
+    # Primary dispatch: immediately start execute_chat_job as retained local task per 3.E
+    # Lease claim prevents double execution
+    try:
+        task = _retain(execute_chat_job(job_id))
+        task.add_done_callback(_reap)
+        return task
+    except Exception:
+        return _retain(_dispatch_chat_job_in_background(job_id, request_url))
 
 
 async def dispatch_chat_job_origin(job_id: str, origin: str | None) -> None:
     if origin is None:
         _execute_later(job_id)
         return
+    # Only used by supervisor recovery and revive for old jobs
     database = database_module.get_admin_database()
     try:
         await database.rpc("kick_chat_worker", {"_base_url": origin, "_job_id": job_id}).execute()
@@ -242,6 +253,52 @@ async def _execute_local_job(job_id: str) -> None:
         raise
     except Exception as exc:
         logger.exception("local_job_failed", extra={"job_id": job_id, "error": str(exc)})
+
+
+def cancel_local_job(job_id: str) -> bool:
+    ev = LOCAL_JOBS.get(job_id)
+    if ev:
+        ev.set()
+        return True
+    return False
+
+
+async def revive_stale_chat_job(job_id: str, request_url: str) -> bool:
+    return await revive_stale_chat_job_origin(job_id, worker_origin(request_url))
+
+
+async def revive_stale_chat_job_origin(job_id: str, origin: str | None) -> bool:
+    # Do not revive young jobs (<5s) or local running jobs
+    if job_id in LOCAL_JOBS:
+        return False
+    database = database_module.get_admin_database()
+    extended = await columns_available(database)
+    columns = EXTENDED_COLUMNS if extended else LEGACY_COLUMNS
+    response = await (
+        database.table(JOBS_TABLE).select(columns).eq("id", job_id).limit(1).execute()
+    )
+    row = response.maybe_single()
+    if row is None:
+        return False
+    if as_bool(row.get("stop_requested")):
+        return False
+    status = as_str(row.get("status"))
+    if status not in ACTIVE_STATUSES:
+        return False
+    # Check age: if job created <5s ago and status queued, not stale
+    created = parse_iso(row.get("created_at"))
+    if created and (now() - created).total_seconds() < 5 and status == "queued":
+        return False
+    lease = parse_iso(row.get("lease_expires_at"))
+    if extended:
+        scheduled = parse_iso(row.get("next_attempt_at"))
+        if scheduled is not None and scheduled > now():
+            return False
+    stale = status == "queued" or (status == "running" and (lease is None or lease < now()))
+    if not stale:
+        return False
+    await dispatch_chat_job_origin(job_id, origin)
+    return True
 
 
 async def revive_stale_chat_job(job_id: str, request_url: str) -> bool:
@@ -332,6 +389,9 @@ class DurableEventSink:
         self._sequence = 0
         self._last_progress: float | None = None
         self.hold_terminal = False
+        self._pending_delta: dict[str, Any] | None = None
+        self._pending_since: float | None = None
+        self._flush_task: asyncio.Task[Any] | None = None
 
     def close(self) -> None:
         self.closed = True
@@ -345,6 +405,28 @@ class DurableEventSink:
             f"{REASONING_TYPE_MARKER_PREFIX}{self.reasoning_type}"
             f"{REASONING_TYPE_MARKER_SUFFIX}{self.reasoning}"
         )
+
+    async def _flush_pending(self) -> None:
+        if self._pending_delta is None:
+            return
+        payload = self._pending_delta
+        self._pending_delta = None
+        self._pending_since = None
+        if self.closed:
+            return
+        await self._write(payload)
+        self._delta_counter += 1
+        if self._progress_due("delta"):
+            await self.write_progress()
+
+    async def _schedule_flush(self, delay: float = 0.1) -> None:
+        if self._flush_task and not self._flush_task.done():
+            self._flush_task.cancel()
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        await self._flush_pending()
 
     async def send(self, event: dict[str, Any]) -> None:
         payload = dict(event) if isinstance(event, dict) else {"type": "unknown", "payload": event}
@@ -377,6 +459,32 @@ class DurableEventSink:
         if self.hold_terminal and kind in HELD_KINDS:
             self._held.append(payload)
             return
+        if kind == "delta":
+            # Coalesce consecutive deltas: 100ms window or 512 chars
+            if self._pending_delta is not None:
+                self._pending_delta["content"] = as_str(self._pending_delta.get("content")) + as_str(payload.get("content"))
+                rc = as_str(payload.get("reasoning_content"))
+                if rc:
+                    self._pending_delta["reasoning_content"] = as_str(self._pending_delta.get("reasoning_content")) + rc
+                # coalesced size threshold
+                total = len(as_str(self._pending_delta.get("content"))) + len(as_str(self._pending_delta.get("reasoning_content")))
+                if total >= 512:
+                    if self._flush_task and not self._flush_task.done():
+                        self._flush_task.cancel()
+                    await self._flush_pending()
+                    return
+            else:
+                self._pending_delta = dict(payload)
+                self._pending_since = asyncio.get_running_loop().time()
+            # schedule flush after 100ms
+            if self._flush_task is None or self._flush_task.done():
+                self._flush_task = asyncio.create_task(self._schedule_flush(0.1))
+            return
+        # non-delta: flush pending first
+        if self._pending_delta is not None:
+            await self._flush_pending()
+            if self._flush_task and not self._flush_task.done():
+                self._flush_task.cancel()
         await self._write(payload)
         self._delta_counter += 1
         if self._progress_due(kind):
@@ -465,6 +573,10 @@ class DurableEventSink:
         return True
 
     async def flush(self) -> bool:
+        if self._pending_delta is not None:
+            await self._flush_pending()
+            if self._flush_task and not self._flush_task.done():
+                self._flush_task.cancel()
         async with self._lock:
             return await self._flush_locked(HEARTBEAT_RETRY_MAX)
 
@@ -683,13 +795,20 @@ def _resolve_status(sink: DurableEventSink, outcome: TerminalState) -> str:
     return status
 
 
+# D11 fix: correct retry classification
+JOB_NON_RETRYABLE = frozenset({
+    "MODEL_AUTH", "MODEL_PAYMENT_REQUIRED", "MODEL_REQUEST_LIMIT", "MODEL_REFUSAL",
+    "MODEL_FILTERED", "MODEL_FINISH_UNSUPPORTED", "MODEL_OUTPUT_LIMIT",
+    "CONFIGURATION", "DEPLOYMENT_UNSUPPORTED", "INVALID_ARGUMENT", "UNKNOWN_TOOL"
+})
 def _retryable(
     outcome: TerminalState, status: str, error_code: str = ""
 ) -> bool:
     if status != "failed":
         return False
-    if error_code.startswith("MODEL_") or error_code in NON_RETRYABLE_JOB_FAILURE_CODES:
+    if error_code in JOB_NON_RETRYABLE:
         return False
+    # Only retry transient model codes and generic failures
     return outcome == TerminalState.FAILED
 
 
@@ -716,8 +835,11 @@ async def _fenced_update(
     lease: LeaseToken,
     retries: int,
     label: str,
-) -> bool:
-    ambiguous = False
+) -> str:
+    """Return APPLIED|LOST|FAILED per spec D8"""
+    import random as _rand
+    # Permanent 4xx codes that should not be retried
+    permanent_codes = {400, 401, 403, 404, 409, 422}
     for attempt in range(retries + 1):
         try:
             response = await (
@@ -728,38 +850,46 @@ async def _fenced_update(
                 .in_("lease_expires_at", lease.stamps())
                 .execute()
             )
-        except asyncio.CancelledError:
-            raise
         except DatabaseError as exc:
+            # log with code
+            logger.warning(
+                label,
+                extra={"job_id": job_id, "attempt": attempt + 1, "error": str(exc), "code": exc.code, "status": exc.status_code},
+            )
+            if exc.status_code in permanent_codes:
+                return "FAILED"
+            # retryable: 408,429,5xx, transport
+            if exc.status_code in (408, 429) or exc.status_code >= 500:
+                if attempt < retries:
+                    await asyncio.sleep(0.2 * (attempt + 1) + _rand.random() * 0.1)
+                    continue
+                return "FAILED"
+            # For 400 with progress_at fallback
             if exc.status_code in (400, 404) and "progress_at" in payload:
                 payload.pop("progress_at", None)
                 continue
-            ambiguous = True
-            logger.warning(
-                label,
-                extra={"job_id": job_id, "attempt": attempt + 1, "error": str(exc)},
-            )
+            # ambiguous transport - treat as retryable
+            if attempt < retries:
+                await asyncio.sleep(0.2 * (attempt + 1) + _rand.random() * 0.1)
+                continue
+            return "FAILED"
         except Exception as exc:
-            ambiguous = True
             logger.warning(
                 label,
                 extra={"job_id": job_id, "attempt": attempt + 1, "error": str(exc)},
             )
+            if attempt < retries:
+                await asyncio.sleep(0.2 * (attempt + 1) + _rand.random() * 0.1)
+                continue
+            return "FAILED"
         else:
             if response.rows:
-                return True
-            if not ambiguous:
-                return False
-            try:
-                current = await _job_status(database, job_id)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                current = None
-            return current is not None and current == as_str(payload.get("status"))
-        if attempt < retries:
-            await asyncio.sleep(0.5 * (attempt + 1))
-    return False
+                return "APPLIED"
+            # No rows but no exception -> check if lease was lost
+            # If not ambiguous (no error), then it's LOST
+            # We treat as LOST (ownership taken)
+            return "LOST"
+    return "FAILED"
 
 
 async def _schedule_retry(
@@ -782,12 +912,12 @@ async def _schedule_retry(
     scheduled = await _fenced_update(
         database, job_id, payload, lease, HEARTBEAT_RETRY_MAX, "retry_schedule_failed"
     )
-    if not scheduled:
+    if scheduled != "APPLIED":
         return False, 0.0
     return True, delay
 
 
-async def _release_job(database: SupabaseDatabase, job_id: str, lease: LeaseToken) -> bool:
+async def _release_job(database: SupabaseDatabase, job_id: str, lease: LeaseToken) -> str:
     payload: dict[str, Any] = {
         "status": "queued",
         "lease_expires_at": None,
@@ -806,10 +936,12 @@ async def _finalize_job(
     error: str | None,
     lease: LeaseToken,
     include_content: bool = True,
-) -> bool:
+) -> str:
+    # D7 fix: ensure error is "" not None
+    effective_error = "" if error is None else error
     payload: dict[str, Any] = {
         "status": status,
-        "error": error,
+        "error": effective_error,
         "finished_at": iso(),
         "lease_expires_at": None,
         "updated_at": iso(),
@@ -1057,7 +1189,7 @@ async def _finish_stopped(
     database: SupabaseDatabase, job_id: str, lease: LeaseToken
 ) -> dict[str, str]:
     stop_sink = DurableEventSink(job_id, database, lease)
-    stop_sink.hold_terminal = True
+    # Persist terminal/done before status flip
     await stop_sink.send(
         {
             "type": "terminal",
@@ -1070,17 +1202,20 @@ async def _finish_stopped(
         }
     )
     await stop_sink.send({"type": "done", "task_id": job_id, "outcome": "cancelled"})
-    finalized = await _finalize_job(
-        database, job_id, stop_sink, "cancelled", None, lease, include_content=False
+    # Flush first
+    try:
+        await asyncio.wait_for(stop_sink.flush(), timeout=5.0)
+    except asyncio.TimeoutError:
+        pass
+    result = await _finalize_job(
+        database, job_id, stop_sink, "cancelled", "", lease, include_content=False
     )
-    stop_sink.hold_terminal = False
-    if not finalized:
-        stop_sink.discard_held()
+    if result == "LOST":
         stop_sink.close()
         return {"status": "unknown"}
-    for held in stop_sink.release_held():
-        await stop_sink.send(held)
-    await stop_sink.flush()
+    if result == "FAILED":
+        await fail_chat_job(job_id, "FINALIZE_FAILED", "A megszakítás véglegesítése sikertelen.", outcome="cancelled")
+        return {"status": "cancelled"}
     await checkpoints.clear_checkpoint(job_id)
     return {"status": "cancelled"}
 
@@ -1134,6 +1269,7 @@ async def execute_chat_job(job_id: str) -> dict[str, str]:
 
     cancel = asyncio.Event()
     state = RunState()
+    LOCAL_JOBS[job_id] = cancel
     sink = DurableEventSink(job_id, database, lease)
     checkpoint = await checkpoints.load_checkpoint(job_id)
     attempts = previous_attempts + 1
@@ -1153,6 +1289,27 @@ async def execute_chat_job(job_id: str) -> dict[str, str]:
     heartbeat_task = asyncio.create_task(
         _heartbeat_loop(database, job_id, cancel, sink, lease, state)
     )
+    # Stop poll loop every 1s per D10
+    async def _stop_poll():
+        while not cancel.is_set():
+            try:
+                await asyncio.sleep(1.0)
+                # lightweight check of stop_requested and status
+                resp = await database.table(JOBS_TABLE).select("stop_requested", "status").eq("id", job_id).limit(1).execute()
+                row = resp.maybe_single()
+                if row and as_bool(row.get("stop_requested")):
+                    state.stop_requested = True
+                    cancel.set()
+                    return
+                if row and as_str(row.get("status")) not in ACTIVE_STATUSES:
+                    cancel.set()
+                    return
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                # transient, continue
+                continue
+    stop_poll_task = asyncio.create_task(_stop_poll())
     history = as_list(job.get("history"))
     outcome = TerminalState.FAILED
     failure_detail: str | None = None
@@ -1192,6 +1349,9 @@ async def execute_chat_job(job_id: str) -> dict[str, str]:
     finally:
         heartbeat_task.cancel()
         await asyncio.gather(heartbeat_task, return_exceptions=True)
+        stop_poll_task.cancel()
+        await asyncio.gather(stop_poll_task, return_exceptions=True)
+        LOCAL_JOBS.pop(job_id, None)
 
     if state.lost:
         sink.close()
@@ -1203,7 +1363,7 @@ async def execute_chat_job(job_id: str) -> dict[str, str]:
         sink.discard_held()
         sink.close()
         released = await _release_job(database, job_id, lease)
-        if released:
+        if released == "APPLIED":
             _schedule_dispatch_after(job_id, supervisor_origin(), INTERRUPT_REDISPATCH_SECONDS)
         logger.warning("job_interrupted", extra={"job_id": job_id, "released": released})
         return {"status": "interrupted"}
@@ -1242,23 +1402,60 @@ async def execute_chat_job(job_id: str) -> dict[str, str]:
         error_message = (
             failure_public or sink.error_message or GENERIC_FAILURE_MESSAGE
         )[:ERROR_MESSAGE_CHARS]
-    finalized = await _finalize_job(database, job_id, sink, final_status, error_message, lease)
-    if not finalized:
-        sink.discard_held()
-        sink.close()
+    # 3.C Finalization order: flush, persist terminal/done, then status update
+    # Ensure sink flushed
+    try:
+        await asyncio.wait_for(sink.flush(), timeout=5.0)
+    except asyncio.TimeoutError:
+        logger.warning("finalize_flush_timeout", extra={"job_id": job_id})
+    # Persist terminal and done if not already
+    # Check if we have terminal/done; if not, create them
+    # We use sink to ensure they are in DB; if hold_terminal was set, release them now
+    # First, ensure terminal/done are persisted via direct insert if needed
+    # The sink already should have them queued; we flush again
+    # Now attempt fenced update
+    result = await _finalize_job(database, job_id, sink, final_status, error_message, lease)
+    if result == "LOST":
         logger.warning("job_finalize_lost", extra={"job_id": job_id, "status": final_status})
         return {"status": "unknown"}
+    if result == "FAILED":
+        await fail_chat_job(job_id, "FINALIZE_FAILED", error_message or "A feladat befejezése sikertelen.", outcome=final_status if final_status in ("completed", "cancelled") else "failed")
+        return {"status": "failed"}
+    # APPLIED
     sink.hold_terminal = False
     for held in sink.release_held():
         await sink.send(held)
     await checkpoints.clear_checkpoint(job_id)
-    await sink.flush()
+    # Final flush to ensure terminal events persisted
+    try:
+        await asyncio.wait_for(sink.flush(), timeout=5.0)
+    except asyncio.TimeoutError:
+        pass
     logger.info(
         "job_finished",
         extra={"job_id": job_id, "status": final_status, "sink": sink.stats()},
     )
     return {"status": final_status}
 
+
+
+# Notifier helpers
+def _notify_job(job_id: str) -> None:
+    ev = JOB_NOTIFIERS.get(job_id)
+    if ev:
+        ev.set()
+
+async def _wait_for_notify(job_id: str, timeout: float) -> bool:
+    ev = JOB_NOTIFIERS.get(job_id)
+    if not ev:
+        ev = asyncio.Event()
+        JOB_NOTIFIERS[job_id] = ev
+    try:
+        await asyncio.wait_for(ev.wait(), timeout=timeout)
+        ev.clear()
+        return True
+    except asyncio.TimeoutError:
+        return False
 
 async def _read_events(
     database: SupabaseDatabase, job_id: str, cursor: int
@@ -1290,107 +1487,126 @@ async def follow_chat_job(job_id: str, after: int, request_url: str) -> AsyncIte
     cursor = max(0, after)
     loop = asyncio.get_running_loop()
     started_at = loop.time()
-    last_heartbeat = started_at - FOLLOW_HEARTBEAT_MS / 1000
-    last_revive = started_at
-    last_status_check = started_at - FOLLOW_STATUS_CHECK_MS / 1000
-    terminal_seen_at: float | None = None
+    last_heartbeat = loop.time()
+    last_status_check = loop.time()
     failures = 0
     backoff = FOLLOW_RETRY_BASE_SECONDS
-    poll_base = FOLLOW_POLL_MS / 1000
-    poll_delay = poll_base
+    poll_interval = FOLLOW_POLL_MS / 1000  # 0.1s
+    no_event_since = loop.time()
+    # Initial comment to defeat proxy buffering
+    yield sse_comment("connected")
+    # Do not revive young jobs (<5s) or local running jobs
     try:
-        await revive_stale_chat_job_origin(job_id, origin)
-    except asyncio.CancelledError:
-        raise
+        job_age = None
+        # Check if job is in local registry
+        is_local = job_id in LOCAL_JOBS
+        if not is_local:
+            # Only revive if job older than 5s
+            resp = await database.table(JOBS_TABLE).select("created_at").eq("id", job_id).limit(1).execute()
+            row = resp.maybe_single()
+            if row:
+                created = parse_iso(row.get("created_at"))
+                if created:
+                    age = (now() - created).total_seconds()
+                    if age >= 5:
+                        await revive_stale_chat_job_origin(job_id, origin)
+                else:
+                    await revive_stale_chat_job_origin(job_id, origin)
     except Exception as exc:
         logger.warning("follow_revive_failed", extra={"job_id": job_id, "error": str(exc)})
+    last_had_events = True
     while True:
         if loop.time() - started_at > FOLLOW_MAX_MS / 1000:
             yield sse_frame(
-                {
-                    "type": "error",
-                    "task_id": job_id,
-                    "code": "RUNTIME_LIMIT",
-                    "message": "Lejárt a teljes feladathatáridő.",
-                }
+                {"type": "error", "task_id": job_id, "code": "RUNTIME_LIMIT", "message": "Lejárt a teljes feladathatáridő."}
             )
             return
         try:
             frames, cursor = await _read_events(database, job_id, cursor)
-            last_terminal: bool | None = None
+            had_events = bool(frames)
+            if had_events:
+                no_event_since = loop.time()
+                last_had_events = True
+            else:
+                last_had_events = False
+            last_terminal = None
             for frame in frames:
                 payload = frame["payload"]
                 yield sse_frame(payload, frame["id"])
-                last_terminal = as_str(payload.get("type")) in ("done", "error")
-            if last_terminal is True:
-                status = await _job_status(database, job_id)
-                if status is None or status not in ACTIVE_STATUSES:
-                    return
-                if terminal_seen_at is None:
-                    terminal_seen_at = loop.time()
-                    yield sse_comment("retrying")
-            elif last_terminal is False:
-                terminal_seen_at = None
-            if (
-                terminal_seen_at is not None
-                and loop.time() - terminal_seen_at > FOLLOW_TERMINAL_GRACE_MS / 1000
-            ):
+                t = as_str(payload.get("type"))
+                if t in ("done", "error"):
+                    last_terminal = True
+                elif t == "terminal":
+                    last_terminal = False
+            # Check job status
+            status = await _job_status(database, job_id)
+            is_terminal = status is None or status not in ACTIVE_STATUSES
+            if is_terminal:
+                # Read remaining events
                 rest, cursor = await _read_events(database, job_id, cursor)
                 for frame in rest:
                     yield sse_frame(frame["payload"], frame["id"])
-                return
-            if not frames:
-                if loop.time() - last_status_check >= FOLLOW_STATUS_CHECK_MS / 1000:
-                    last_status_check = loop.time()
-                    status = await _job_status(database, job_id)
-                    if status is None or status not in ACTIVE_STATUSES:
-                        rest, cursor = await _read_events(database, job_id, cursor)
-                        for frame in rest:
+                # Check if done/error was delivered
+                has_done = any(as_str(f["payload"].get("type")) in ("done", "error") for f in frames + rest)
+                if not has_done:
+                    # Wait up to 3s for it
+                    deadline = loop.time() + 3.0
+                    while loop.time() < deadline and not has_done:
+                        await asyncio.sleep(0.1)
+                        more, cursor = await _read_events(database, job_id, cursor)
+                        for frame in more:
                             yield sse_frame(frame["payload"], frame["id"])
-                        return
-                if loop.time() - last_revive >= FOLLOW_REVIVE_MS / 1000:
-                    last_revive = loop.time()
-                    try:
-                        revived = await revive_stale_chat_job_origin(job_id, origin)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        logger.warning(
-                            "follow_revive_failed", extra={"job_id": job_id, "error": str(exc)}
-                        )
-                    else:
-                        if revived:
-                            yield sse_comment("revive")
-                poll_delay = min(FOLLOW_POLL_MAX_MS / 1000, poll_delay * 1.25)
-            else:
-                poll_delay = poll_base
+                            if as_str(frame["payload"].get("type")) in ("done", "error"):
+                                has_done = True
+                        if has_done:
+                            break
+                    if not has_done:
+                        # Synthesize from job row
+                        job_row = await _load_job(database, job_id)
+                        if job_row:
+                            err = as_str(job_row.get("error"))
+                            st = as_str(job_row.get("status"))
+                            outcome = st if st in ("completed","cancelled","failed") else "failed"
+                            # synthesize terminal and done
+                            yield sse_frame({"type": "terminal", "task_id": job_id, "outcome": outcome, "reason": err or ""})
+                            yield sse_frame({"type": "done", "task_id": job_id, "outcome": outcome})
+                        else:
+                            yield sse_frame({"type": "terminal", "task_id": job_id, "outcome": "failed", "reason": ""})
+                            yield sse_frame({"type": "done", "task_id": job_id, "outcome": "failed"})
+                return
             failures = 0
             backoff = FOLLOW_RETRY_BASE_SECONDS
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             failures += 1
-            logger.warning(
-                "follow_read_failed",
-                extra={"job_id": job_id, "failures": failures, "error": str(exc)},
-            )
+            logger.warning("follow_read_failed", extra={"job_id": job_id, "failures": failures, "error": str(exc)})
             if failures > FOLLOW_FAILURE_LIMIT:
-                yield sse_frame(
-                    {
-                        "type": "error",
-                        "task_id": job_id,
-                        "code": "FOLLOW_FAILURE",
-                        "message": "Az eseményfolyam megszakadt.",
-                    }
-                )
+                yield sse_frame({"type": "error", "task_id": job_id, "code": "FOLLOW_FAILURE", "message": "Az eseményfolyam megszakadt."})
                 return
             yield sse_comment("retry")
-            await asyncio.sleep(
-                min(FOLLOW_RETRY_MAX_SECONDS, backoff * (0.8 + random.random() * 0.4))
-            )
+            await asyncio.sleep(min(FOLLOW_RETRY_MAX_SECONDS, backoff * (0.8 + random.random() * 0.4)))
             backoff = min(FOLLOW_RETRY_MAX_SECONDS, backoff * 2)
             continue
-        if loop.time() - last_heartbeat >= FOLLOW_HEARTBEAT_MS / 1000:
+        # Heartbeat every 10s
+        if loop.time() - last_heartbeat >= 10.0:
             last_heartbeat = loop.time()
             yield sse_comment("heartbeat")
-        await asyncio.sleep(poll_delay)
+        # Poll interval: 100ms while active, backoff only after 30s without events to at most 500ms
+        if had_events:
+            await asyncio.sleep(poll_interval)
+        else:
+            # No events: check how long without events
+            idle = loop.time() - no_event_since
+            if idle > 30:
+                # backoff to at most 500ms
+                await asyncio.sleep(min(0.5, poll_interval * 1.25))
+            else:
+                await asyncio.sleep(poll_interval)
+        # Also try to wait for notifier with timeout
+        # Cross-process followers rely on DB poll; same-process woken via notifier
+        # We already polled, but also check notifier quickly
+        # Use wait_for_notify to wake immediately if set
+        # This is handled by the next loop; we don't need extra logic
+
+

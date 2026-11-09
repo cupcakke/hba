@@ -1714,10 +1714,9 @@ body{ position: fixed; inset: 0; }
 }
 
 </style>
-<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-<script type="text/babel">
+<script src="/chat-core.js" defer></script>
+<script src="/liquid-glass-engine.js" defer></script>
+<script type="text/javascript">
 (function(){
 class LensSignal {
   constructor(initial) {
@@ -6895,7 +6894,7 @@ const GlassSlider = ({ value, onChange, min = 0, max = 100 }) => {
   function renderTextFiles(files, messageIndex){
     if(!files || !files.length) return "";
     return files.map(function(file, index){
-      return '<div class="user-text-file"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6M8 13h8M8 17h8"/></svg><span class="user-text-file-name">' + escapeHtml(file.name) + '</span><button class="user-text-file-download" type="button" data-text-file-message="' + messageIndex + '" data-text-file-index="' + index + '">Letöltés</button></div>';
+      return '<div class="user-text-file"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6M8 13h8M8 17h8"/></svg><span class="user-text-file-name">' + escapeHtml(file.name) + '</span><button class="user-text-file-download" type="button" data-text-file-download data-text-file-message="' + messageIndex + '" data-text-file-index="' + index + '">Letöltés</button></div>';
     }).join("");
   }
 
@@ -7145,13 +7144,18 @@ const GlassSlider = ({ value, onChange, min = 0, max = 100 }) => {
 
   function showEditBanner(){
     hideEditBanner();
-    var host = textarea.closest(".ibox") || textarea.parentElement;
-    if(!host) return;
+    var inner = document.querySelector(".ib-inner");
+    var row = document.querySelector(".ib-row");
     var banner = document.createElement("div");
     banner.className = "edit-banner";
     banner.id = "edit-banner";
     banner.innerHTML = '<span>Üzenet szerkesztése — új ág készül</span><button type="button" id="edit-cancel">Mégse</button>';
-    host.parentElement.insertBefore(banner, host);
+    if(inner && row && row.parentElement === inner){
+      inner.insertBefore(banner, row);
+    } else {
+      var host = textarea.closest(".ibox") || textarea.parentElement;
+      if(host && host.parentElement) host.parentElement.insertBefore(banner, host);
+    }
     banner.querySelector("#edit-cancel").addEventListener("click", cancelEdit);
   }
 
@@ -9062,7 +9066,6 @@ const GlassSlider = ({ value, onChange, min = 0, max = 100 }) => {
       toast("Várd meg, amíg a képkérés elkészül.", "inf");
       return;
     }
-    if(editSession){ editSession = null; hideEditBanner(); }
     if(busy){
       var redirectText = textarea.value.trim();
       var hasRedirectInput = !!(redirectText || selectedImages.length || selectedTextFiles.length);
@@ -9108,14 +9111,8 @@ const GlassSlider = ({ value, onChange, min = 0, max = 100 }) => {
     }
     var text = textarea.value.trim();
     if(!text && !selectedImages.length && !selectedTextFiles.length) return;
-    if(text && selectedImages.length && !selectedTextFiles.length){
-      var editReferences = selectedImages.slice(0, imageReferenceLimit());
-      var editSettings = currentImageFlowSettings();
-      editSettings.num_images = 1;
-      saveImageFlowSettings(editSettings);
-      runImageRequest(text, editReferences, editSettings, {addUserMessage:true, clearComposer:true});
-      return;
-    }
+    // D39 fix: text+image should be normal multimodal chat, not image editing
+    // Image editing only via explicit Create Image flow
       var content = addImageParts(text || (selectedImages.length ? "Elemezd a csatolt képet." : ""));
     messages.push({role:"user", content:content});
     persistCurrent();
@@ -10835,6 +10832,6 @@ const GlassSlider = ({ value, onChange, min = 0, max = 100 }) => {
 })();
 </script>
 
-<script src="/chat-work.js"></script>
+<script src="/chat-work.js" defer></script>
 </body>
 </html>

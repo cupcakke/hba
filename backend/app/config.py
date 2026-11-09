@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Literal
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+ReasoningEffort = Literal["minimal", "low", "medium", "high", "xhigh"]
 
 
 class Settings(BaseSettings):
@@ -57,6 +61,12 @@ class Settings(BaseSettings):
     instavm_url: str = "https://api.instavm.io"
     published_origin: str = ""
 
+    # Reasoning effort settings (validated)
+    model_reasoning_effort: ReasoningEffort = "medium"
+    model_reasoning_effort_cognitive: ReasoningEffort = "low"
+    model_reasoning_effort_escalated: ReasoningEffort = "high"
+    model_reasoning_summary: str = "detailed"
+
     supervisor_enabled: bool = True
     supervisor_interval_ms: int = 15_000
     supervisor_leader_lease_ms: int = 45_000
@@ -97,6 +107,14 @@ class Settings(BaseSettings):
     chat_nix_installer_sha256: str = ""
 
     static_dir: str = "../public"
+
+    @field_validator("model_reasoning_effort", "model_reasoning_effort_cognitive", "model_reasoning_effort_escalated")
+    @classmethod
+    def validate_effort(cls, v: str) -> str:
+        allowed = {"minimal", "low", "medium", "high", "xhigh"}
+        if v not in allowed:
+            raise ValueError(f"Invalid reasoning effort: {v}")
+        return v
 
 
 @lru_cache(maxsize=1)

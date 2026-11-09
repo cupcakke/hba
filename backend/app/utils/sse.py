@@ -7,7 +7,6 @@ SSE_MEDIA_TYPE = "text/event-stream; charset=utf-8"
 NO_STORE_HEADERS = {
     "Cache-Control": "private, no-store, no-cache, no-transform",
     "X-Accel-Buffering": "no",
-    "Connection": "keep-alive",
 }
 
 

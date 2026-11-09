@@ -266,7 +266,7 @@ def _normalized_browser_id(browser_id: Any) -> str:
         raise CloudBrowserError("The browser identifier is missing.")
     if len(candidate) > MAX_BROWSER_ID_CHARS:
         raise CloudBrowserError("The browser identifier is too long.")
-    if any(character in candidate for character in "/?#%\\"):
+    if any(character in candidate for character in "/?#\\"):
         raise CloudBrowserError("The browser identifier is invalid.")
     return candidate
 

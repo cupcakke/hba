@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
 import math
+import random
 import re
-from dataclasses import dataclass, field
+import time
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
+from functools import lru_cache
 from typing import Any, Awaitable, Callable
 
 from app import database as database_module
@@ -77,16 +83,45 @@ ALLOWED_COMPONENTS = (
     "model",
 )
 
+DSL_KEYWORDS = ("SKILL", "WHEN", "REQUIRE", "STEP", "VERIFY", "RECOVER")
+
+REFLECTION_FIELDS = (
+    "failure_point",
+    "component",
+    "root_cause",
+    "pivot_action",
+    "patch",
+    "failed_action",
+    "corrective_action",
+)
+
 EMBED_DIM = 256
 REASON_MAX_DEPTH = 4
 REASON_MAX_BRANCHES = 6
 REASON_MAX_CALLS = 300
 
+PROBE_TIMEOUT_SECONDS = 60.0
+THINK_ATTEMPTS = 3
+THINK_BASE_DELAY = 0.5
+POLICY_WEIGHT_BOUND = 5.0
+POLICY_DECAY = 0.99
+SKILL_RETIRE_MIN_TRIALS = 8
+SKILL_RETIRE_UPPER_BOUND = 0.3
+CLIP_MARKER = "\n[...]\n"
+
+ATOMIC_REASONER_SYSTEM = (
+    "Izolált következtető vagy. Tömören, tényszerűen válaszolj a kérdésre; "
+    "ne javasolj állapotmódosítást."
+)
+
 Think = Callable[[str, str], Awaitable[str]]
 Probe = Callable[[str], Awaitable[bool]]
 
 _db_write_lock = asyncio.Lock()
+_counter_lock = asyncio.Lock()
 _subgoal_counter = 0
+_JSON_DECODER = json.JSONDecoder()
+_NOT_FOUND = object()
 
 
 @dataclass
@@ -108,6 +143,55 @@ class GoalSpec:
             required_files=list(self.required_files),
             file_contents=[dict(item) for item in self.file_contents],
         )
+
+
+def to_float(value: Any, default: float = 0.0) -> float:
+    if isinstance(value, bool):
+        return default
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return result if math.isfinite(result) else default
+
+
+def to_int(value: Any, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    number = to_float(value, math.nan)
+    if math.isnan(number):
+        return default
+    return int(number)
+
+
+def to_str_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if item is not None]
+
+
+def to_dict_list(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, dict)]
+
+
+def to_file_contents(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    return [
+        {"path": item["path"], "contains": item["contains"]}
+        for item in value
+        if isinstance(item, dict)
+        and isinstance(item.get("path"), str)
+        and isinstance(item.get("contains"), str)
+    ]
+
+
+def clamp(value: float, low: float, high: float) -> float:
+    return min(high, max(low, value))
 
 
 @dataclass
@@ -162,7 +246,10 @@ class Sigma:
 
     @staticmethod
     def from_dict(payload: dict[str, Any]) -> "Sigma":
-        goal = payload.get("goal") if isinstance(payload.get("goal"), dict) else {}
+        goal_raw = payload.get("goal")
+        goal = goal_raw if isinstance(goal_raw, dict) else {}
+        subgoals_raw = payload.get("subgoals")
+        vector_raw = payload.get("vector")
         return Sigma(
             objective=str(payload.get("objective") or ""),
             strategy=str(payload.get("strategy") or ""),
@@ -172,20 +259,20 @@ class Sigma:
                     str(item.get("text") or ""),
                     bool(item.get("done")),
                 )
-                for item in payload.get("subgoals") or []
+                for item in (subgoals_raw if isinstance(subgoals_raw, list) else [])
                 if isinstance(item, dict)
             ],
-            closed_subgoals=int(payload.get("closed_subgoals") or 0),
-            facts=[str(item) for item in payload.get("facts") or []],
-            blockers=[str(item) for item in payload.get("blockers") or []],
-            next_steps=[str(item) for item in payload.get("next_steps") or []],
-            vector=[float(item) for item in payload.get("vector") or []],
-            gate=float(payload.get("gate") or 0.0),
+            closed_subgoals=max(0, to_int(payload.get("closed_subgoals"))),
+            facts=to_str_list(payload.get("facts")),
+            blockers=to_str_list(payload.get("blockers")),
+            next_steps=to_str_list(payload.get("next_steps")),
+            vector=[to_float(item, 0.5) for item in vector_raw] if isinstance(vector_raw, list) else [],
+            gate=to_float(payload.get("gate")),
             decision=str(payload.get("decision") or "act"),
             goal=GoalSpec(
-                state_pointers=[dict(item) for item in goal.get("state_pointers") or []],
-                required_files=[str(item) for item in goal.get("required_files") or []],
-                file_contents=[dict(item) for item in goal.get("file_contents") or []],
+                state_pointers=to_dict_list(goal.get("state_pointers")),
+                required_files=to_str_list(goal.get("required_files")),
+                file_contents=to_file_contents(goal.get("file_contents")),
             ),
         )
 
@@ -224,10 +311,20 @@ def clip(value: str, max_length: int) -> str:
         return ""
     if len(value) <= max_length:
         return value
-    end = max_length
-    if 0xD800 <= ord(value[end - 1]) <= 0xDBFF:
-        end -= 1
-    return value[:end]
+    return value[:max_length]
+
+
+def clip_middle(value: str, max_length: int, head_ratio: float = 0.25) -> str:
+    if max_length <= 0:
+        return ""
+    if len(value) <= max_length:
+        return value
+    if max_length <= len(CLIP_MARKER) + 2:
+        return value[-max_length:]
+    budget = max_length - len(CLIP_MARKER)
+    head = int(budget * clamp(head_ratio, 0.0, 1.0))
+    tail = budget - head
+    return value[:head] + CLIP_MARKER + value[len(value) - tail :]
 
 
 def is_record(value: Any) -> bool:
@@ -246,13 +343,21 @@ def strip_sensitive(value: Any) -> Any:
     return out
 
 
+def normalize_vector(vector: list[float]) -> list[float]:
+    result: list[float] = []
+    for index in range(len(VECTOR_DIMS)):
+        raw = vector[index] if index < len(vector) else 0.5
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(raw):
+            raw = 0.5
+        result.append(clamp(float(raw), 0.0, 1.0))
+    return result
+
+
 def gate(vector: list[float]) -> tuple[float, str]:
+    normalized = normalize_vector(vector)
     z = GATE_BIAS
     for index, dim in enumerate(VECTOR_DIMS):
-        value = vector[index] if index < len(vector) else 0.5
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
-            value = 0.5
-        z += GATE_WEIGHTS[dim] * float(value)
+        z += GATE_WEIGHTS[dim] * normalized[index]
     g = 1 / (1 + math.exp(-z))
     if g >= 0.5:
         decision = "act"
@@ -261,6 +366,21 @@ def gate(vector: list[float]) -> tuple[float, str]:
     else:
         decision = "replan"
     return g, decision
+
+
+def gate_breakdown(vector: list[float]) -> list[dict[str, Any]]:
+    normalized = normalize_vector(vector)
+    rows = [
+        {
+            "dimension": dim,
+            "value": normalized[index],
+            "weight": GATE_WEIGHTS[dim],
+            "contribution": GATE_WEIGHTS[dim] * normalized[index],
+        }
+        for index, dim in enumerate(VECTOR_DIMS)
+    ]
+    rows.sort(key=lambda row: abs(row["contribution"]), reverse=True)
+    return rows
 
 
 def empty_sigma(objective: str) -> Sigma:
@@ -274,92 +394,132 @@ def empty_sigma(objective: str) -> Sigma:
     )
 
 
+def dedupe_latest(items: list[Any], limit: int, max_length: int) -> list[str]:
+    seen: set[str] = set()
+    collected: list[str] = []
+    for item in reversed(items):
+        value = clip(str(item).strip(), max_length)
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        collected.append(value)
+        if len(collected) >= limit:
+            break
+    collected.reverse()
+    return collected
+
+
 def maintain(sigma: Sigma) -> Sigma:
     preserved_goal = sigma.goal.copy()
     closed = len([item for item in sigma.subgoals if item.done])
     clean = strip_sensitive(sigma.to_dict())
-    assert isinstance(clean, dict)
-    result = Sigma.from_dict(clean)
+    result = Sigma.from_dict(clean) if isinstance(clean, dict) else sigma.copy()
     result.goal = preserved_goal
-    result.subgoals = [
-        Subgoal(clip(item.id, 40), clip(item.text, 400), False)
-        for item in sigma.subgoals
-        if not item.done
-    ][:12]
+    result.objective = clip(result.objective, 4000)
+    seen_ids: set[str] = set()
+    subgoals: list[Subgoal] = []
+    for item in sigma.subgoals:
+        if item.done:
+            continue
+        identifier = clip(item.id, 40)
+        text = clip(item.text, 400)
+        if not text:
+            continue
+        if identifier and identifier in seen_ids:
+            continue
+        if identifier:
+            seen_ids.add(identifier)
+        subgoals.append(Subgoal(identifier, text, False))
+    result.subgoals = subgoals[:12]
     result.closed_subgoals = sigma.closed_subgoals + closed
-    seen: set[str] = set()
-    facts: list[str] = []
-    for fact in result.facts:
-        value = clip(str(fact), 400)
-        if value not in seen:
-            seen.add(value)
-            facts.append(value)
-    result.facts = facts[-20:]
-    seen.clear()
-    blockers: list[str] = []
-    for blocker in result.blockers:
-        value = clip(str(blocker), 400)
-        if value not in seen:
-            seen.add(value)
-            blockers.append(value)
-    result.blockers = blockers[-8:]
-    result.next_steps = [clip(str(item), 400) for item in result.next_steps[:8]]
+    result.facts = dedupe_latest(result.facts, 20, 400)
+    result.blockers = dedupe_latest(result.blockers, 8, 400)
+    result.next_steps = [
+        clip(str(item).strip(), 400) for item in result.next_steps if str(item).strip()
+    ][:8]
     result.strategy = clip(str(result.strategy), 2000)
+    needs_recompute = len(sigma.vector) != len(VECTOR_DIMS)
+    result.vector = normalize_vector(result.vector)
+    if needs_recompute:
+        result.gate, result.decision = gate(result.vector)
     return result
 
 
-def scan_balanced_json(source: str) -> Any:
-    length = len(source)
-    for index in range(length):
-        char = source[index]
-        if char not in "{[":
+def scan_balanced_json(source: str, expect: type | None = None) -> Any:
+    for match in re.finditer(r"[{\[]", source):
+        try:
+            value, _ = _JSON_DECODER.raw_decode(source, match.start())
+        except (json.JSONDecodeError, RecursionError):
             continue
-        stack = ["}" if char == "{" else "]"]
-        in_string = False
-        escape = False
-        for position in range(index + 1, length):
-            current = source[position]
-            if in_string:
-                if escape:
-                    escape = False
-                elif current == "\\":
-                    escape = True
-                elif current == '"':
-                    in_string = False
-                continue
-            if current == '"':
-                in_string = True
-            elif current == "{":
-                stack.append("}")
-            elif current == "[":
-                stack.append("]")
-            elif current in "}]":
-                if stack and stack[-1] == current:
-                    stack.pop()
-                    if not stack:
-                        try:
-                            return json.loads(source[index : position + 1])
-                        except json.JSONDecodeError:
-                            break
-                else:
-                    break
+        if expect is None or isinstance(value, expect):
+            return value
     return None
 
 
-def extract_json(text: str) -> Any:
+def extract_json(text: str, expect: type | None = None) -> Any:
     for match in re.finditer(r"```(?:json)?\s*([\s\S]*?)```", text, re.IGNORECASE):
         candidate = match.group(1)
         if candidate:
-            parsed = scan_balanced_json(candidate)
+            parsed = scan_balanced_json(candidate, expect)
             if parsed is not None:
                 return parsed
-    return scan_balanced_json(text)
+    return scan_balanced_json(text, expect)
 
 
 def collect_strings(value: Any, limit: int) -> list[str]:
     if limit <= 0 or not isinstance(value, list):
         return []
-    return [item for item in value if isinstance(item, str) and item.strip()][:limit]
+    return [item.strip() for item in value if isinstance(item, str) and item.strip()][:limit]
+
+
+async def call_think(
+    think: Think,
+    system: str,
+    user: str,
+    attempts: int = THINK_ATTEMPTS,
+    base_delay: float = THINK_BASE_DELAY,
+) -> str:
+    last_error: Exception | None = None
+    for attempt in range(max(1, attempts)):
+        try:
+            result = await think(system, user)
+        except AgentFault:
+            raise
+        except Exception as exc:
+            last_error = exc
+            if attempt + 1 < attempts:
+                await asyncio.sleep(base_delay * (2**attempt) + random.uniform(0.0, base_delay))
+            continue
+        if isinstance(result, str):
+            return result
+        return "" if result is None else str(result)
+    raise AgentFault(
+        "COGNITIVE_MODEL_UNAVAILABLE",
+        f"A modellhívás ismételt próbálkozás után sem sikerült: {last_error}",
+        502,
+    )
+
+
+async def think_json(
+    think: Think,
+    system: str,
+    user: str,
+    code: str,
+    message: str,
+    attempts: int = 2,
+) -> dict[str, Any]:
+    prompt = user
+    for _ in range(max(1, attempts)):
+        raw = await call_think(think, system, prompt)
+        parsed = extract_json(raw, dict)
+        if is_record(parsed):
+            return parsed
+        prompt = (
+            f"{user}\n\nAz előző válaszod nem tartalmazott érvényes JSON objektumot. "
+            "Adj vissza kizárólag egyetlen érvényes JSON objektumot, magyarázat és kódblokk nélkül."
+            f"\n\nELŐZŐ VÁLASZ:\n{clip(raw, 2000)}"
+        )
+    raise AgentFault(code, message, 502)
 
 
 async def deliberate(think: Think, sigma: Sigma, trace: str, guidance: str) -> Sigma:
@@ -377,12 +537,15 @@ async def deliberate(think: Think, sigma: Sigma, trace: str, guidance: str) -> S
     user = (
         f"MUNKAMEMÓRIA:\n{json.dumps(sigma.to_dict(), ensure_ascii=False)}"
         f"\n\nTANULT ÚTMUTATÁS:\n{guidance or 'nincs'}"
-        f"\n\nFRISS NYOMVONAL:\n{clip(trace, 8000)}"
+        f"\n\nFRISS NYOMVONAL:\n{clip_middle(trace, 8000, 0.2)}"
     )
-    raw_response = await think(system, user)
-    parsed = extract_json(raw_response)
-    if not is_record(parsed):
-        raise AgentFault("COGNITIVE_INVALID_JSON", "A stratégiai tervező (deliberate) érvénytelen JSON választ adott.", 502)
+    parsed = await think_json(
+        think,
+        system,
+        user,
+        "COGNITIVE_INVALID_JSON",
+        "A stratégiai tervező (deliberate) érvénytelen JSON választ adott.",
+    )
     result = sigma.copy()
     if isinstance(parsed.get("strategy"), str):
         result.strategy = parsed["strategy"]
@@ -396,11 +559,11 @@ async def deliberate(think: Think, sigma: Sigma, trace: str, guidance: str) -> S
             if not is_record(entry):
                 continue
             text = entry.get("text")
-            text = text.strip() if isinstance(text, str) else ""
+            text = clip(text.strip(), 400) if isinstance(text, str) else ""
             if not text:
                 continue
             raw_id = entry.get("id")
-            raw_id = raw_id.strip() if isinstance(raw_id, str) else ""
+            raw_id = clip(raw_id.strip(), 40) if isinstance(raw_id, str) else ""
             existing = existing_by_id.get(raw_id) if raw_id else None
             if existing is None:
                 existing = existing_by_text.get(text)
@@ -413,8 +576,9 @@ async def deliberate(think: Think, sigma: Sigma, trace: str, guidance: str) -> S
             identifier = raw_id
             if not identifier or identifier in used_ids:
                 while True:
-                    _subgoal_counter += 1
-                    identifier = f"sg_{_subgoal_counter:08x}"
+                    async with _counter_lock:
+                        _subgoal_counter += 1
+                        identifier = f"sg_{_subgoal_counter:08x}"
                     if identifier not in used_ids:
                         break
             used_ids.add(identifier)
@@ -424,12 +588,7 @@ async def deliberate(think: Think, sigma: Sigma, trace: str, guidance: str) -> S
         result.next_steps = collect_strings(parsed["next_steps"], 5)
     vector = parsed.get("vector")
     if isinstance(vector, list) and len(vector) == len(VECTOR_DIMS):
-        result.vector = [
-            min(1.0, max(0.0, float(item)))
-            if isinstance(item, (int, float)) and not isinstance(item, bool) and math.isfinite(item)
-            else 0.5
-            for item in vector
-        ]
+        result.vector = normalize_vector(vector)
     goal = parsed.get("goal")
     if is_record(goal):
         pointers = goal.get("state_pointers")
@@ -438,19 +597,25 @@ async def deliberate(think: Think, sigma: Sigma, trace: str, guidance: str) -> S
         result.goal = GoalSpec(
             state_pointers=[
                 {"pointer": item["pointer"], "equals": item["equals"]}
-                for item in (pointers or [])
+                for item in (pointers if isinstance(pointers, list) else [])
                 if is_record(item)
                 and isinstance(item.get("pointer"), str)
+                and item["pointer"].startswith("/")
                 and "equals" in item
-                and item.get("equals") is not None
             ][:10],
-            required_files=collect_strings(required_files, 20),
+            required_files=list(
+                dict.fromkeys(
+                    path for path in collect_strings(required_files, 20) if path.startswith("/")
+                )
+            ),
             file_contents=[
                 {"path": item["path"], "contains": item["contains"]}
-                for item in (file_contents or [])
+                for item in (file_contents if isinstance(file_contents, list) else [])
                 if is_record(item)
                 and isinstance(item.get("path"), str)
+                and item["path"].startswith("/")
                 and isinstance(item.get("contains"), str)
+                and item["contains"]
             ][:20],
         )
     g, decision = gate(result.vector)
@@ -459,26 +624,46 @@ async def deliberate(think: Think, sigma: Sigma, trace: str, guidance: str) -> S
     return maintain(result)
 
 
+def as_string_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, list):
+        return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+    return []
+
+
 def apply_state_update(sigma: Sigma, args: dict[str, Any]) -> Sigma:
     result = sigma.copy()
-    fact = args.get("fact")
-    if isinstance(fact, str) and fact.strip():
-        result.facts.append(fact.strip())
-    blocker = args.get("blocker")
-    if isinstance(blocker, str) and blocker.strip():
-        result.blockers.append(blocker.strip())
-    resolve = args.get("resolve_blocker")
-    if isinstance(resolve, str) and resolve.strip():
-        key = resolve.strip().lower()
+    result.facts.extend(as_string_list(args.get("fact")))
+    result.facts.extend(as_string_list(args.get("facts")))
+    result.blockers.extend(as_string_list(args.get("blocker")))
+    result.blockers.extend(as_string_list(args.get("blockers")))
+    resolved = {
+        item.lower()
+        for item in (
+            as_string_list(args.get("resolve_blocker"))
+            + as_string_list(args.get("resolve_blockers"))
+        )
+    }
+    if resolved:
         result.blockers = [
-            item for item in result.blockers if item.strip().lower() != key
+            item for item in result.blockers if item.strip().lower() not in resolved
         ]
-    complete = args.get("complete_subgoal")
-    if isinstance(complete, str) and complete.strip():
-        key = complete.strip()
+    completed = as_string_list(args.get("complete_subgoal")) + as_string_list(
+        args.get("complete_subgoals")
+    )
+    if completed:
+        lowered = {item.lower() for item in completed}
         for subgoal in result.subgoals:
-            if subgoal.id == key or subgoal.text == key:
+            if (
+                subgoal.id in completed
+                or subgoal.text in completed
+                or subgoal.text.lower() in lowered
+            ):
                 subgoal.done = True
+    steps = as_string_list(args.get("next_step")) + as_string_list(args.get("next_steps"))
+    if steps:
+        result.next_steps.extend(steps)
     return maintain(result)
 
 
@@ -486,42 +671,50 @@ def resolve_pointer(root: Any, path: str) -> Any:
     if path == "":
         return root
     if not path.startswith("/"):
-        return None
+        return _NOT_FOUND
     current = root
     for raw in path[1:].split("/"):
         key = raw.replace("~1", "/").replace("~0", "~")
         if isinstance(current, list):
             if not re.match(r"^(0|[1-9][0-9]*)$", key):
-                return None
+                return _NOT_FOUND
             index = int(key)
             if index < 0 or index >= len(current):
-                return None
+                return _NOT_FOUND
             current = current[index]
         elif is_record(current):
             if key not in current:
-                return None
+                return _NOT_FOUND
             current = current[key]
         else:
-            return None
+            return _NOT_FOUND
     return current
 
 
+def is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def deep_equal(left: Any, right: Any) -> bool:
-    if left is right:
-        return True
-    if type(left) is not type(right):
-        return False
-    if left is None or right is None:
+    if is_number(left) and is_number(right):
+        if isinstance(left, float) or isinstance(right, float):
+            return math.isclose(float(left), float(right), rel_tol=1e-9, abs_tol=1e-12)
         return left == right
-    if isinstance(left, list):
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left == right
+    if left is None or right is None:
+        return left is right
+    if isinstance(left, str) and isinstance(right, str):
+        return left == right
+    if isinstance(left, list) and isinstance(right, list):
         if len(left) != len(right):
             return False
-        return all(deep_equal(a, b) for a, b in zip(left, right, strict=False))
+        return all(deep_equal(a, b) for a, b in zip(left, right))
     if is_record(left) and is_record(right):
         if set(left.keys()) != set(right.keys()):
             return False
         return all(deep_equal(left[key], right[key]) for key in left)
-    return left == right
+    return False
 
 
 def shell_quote(value: str) -> str:
@@ -530,41 +723,52 @@ def shell_quote(value: str) -> str:
 
 async def safe_probe(probe: Probe, command: str) -> bool:
     try:
-        return await probe(command)
+        return bool(await asyncio.wait_for(probe(command), timeout=PROBE_TIMEOUT_SECONDS))
     except Exception:
         return False
 
 
 async def verify(sigma: Sigma, probe: Probe | None) -> dict[str, Any]:
     failures: list[str] = []
+    passed: list[str] = []
     payload = sigma.to_dict()
     for pointer in sigma.goal.state_pointers:
         if "equals" not in pointer:
             failures.append(f"Hiányzó elvárt érték (equals): {pointer.get('pointer')}")
             continue
-        actual = resolve_pointer(payload, str(pointer.get("pointer") or ""))
-        if actual is None or not deep_equal(actual, pointer.get("equals")):
+        label = str(pointer.get("pointer") or "")
+        actual = resolve_pointer(payload, label)
+        if actual is _NOT_FOUND or not deep_equal(actual, pointer.get("equals")):
             failures.append(f"Állapot nem egyezik: {pointer.get('pointer')}")
+        else:
+            passed.append(f"state:{label}")
     needs_files = bool(sigma.goal.required_files or sigma.goal.file_contents)
     if needs_files and probe is None:
         failures.append("Fájlellenőrzés szükséges, de nincs elérhető VM.")
     if probe is not None:
+        checks: list[tuple[str, str, str]] = []
         for path in sigma.goal.required_files:
-            if not await safe_probe(probe, f"test -f {shell_quote(path)}"):
-                failures.append(f"Hiányzó fájl: {path}")
+            checks.append(
+                (f"Hiányzó fájl: {path}", f"file:{path}", f"test -f {shell_quote(path)}")
+            )
         for entry in sigma.goal.file_contents:
-            import base64
-
-            encoded = base64.b64encode(entry["contains"].encode("utf-8")).decode("ascii")
+            path = str(entry.get("path") or "")
+            contains = str(entry.get("contains") or "")
+            encoded = base64.b64encode(contains.encode("utf-8")).decode("ascii")
             command = (
                 "node -e 'const fs=require(\"fs\");"
                 "try{const c=fs.readFileSync(process.argv[1],\"utf8\");"
                 "const n=Buffer.from(process.argv[2],\"base64\").toString(\"utf8\");"
                 "process.exit(c.includes(n)?0:1);}catch{process.exit(1);}' "
-                f"{shell_quote(entry['path'])} {shell_quote(encoded)}"
+                f"{shell_quote(path)} {shell_quote(encoded)}"
             )
-            if not await safe_probe(probe, command):
-                failures.append(f"Fájltartalom nem egyezik: {entry['path']}")
+            checks.append((f"Fájltartalom nem egyezik: {path}", f"content:{path}", command))
+        outcomes = await asyncio.gather(*(safe_probe(probe, check[2]) for check in checks))
+        for (failure, label, _), ok in zip(checks, outcomes):
+            if ok:
+                passed.append(label)
+            else:
+                failures.append(failure)
     if sigma.blockers:
         failures.append(f"Nyitott blokkolók: {'; '.join(sigma.blockers)}")
     open_subgoals = [item for item in sigma.subgoals if not item.done]
@@ -579,7 +783,7 @@ async def verify(sigma: Sigma, probe: Probe | None) -> dict[str, Any]:
     )
     if not has_evidence:
         failures.append("Nincs ellenőrizhető bizonyíték a feladat teljesítésére.")
-    return {"ok": not failures, "failures": failures}
+    return {"ok": not failures, "failures": failures, "passed": passed}
 
 
 async def reflect(
@@ -591,13 +795,18 @@ async def reflect(
             'Séma: {"failure_point": a kudarc pontos lépése, "component": felelős komponens (planner|executor|tool|environment|verifier|model), "root_cause": string, "pivot_action": egyetlen konkrét korrekciós lépés, "patch": javítócsomag leírása, "corrective_action": a sikertelen műveletet közvetlenül kiváltó helyes parancs vagy művelet}',
         ]
     )
-    raw = await think(
-        system,
-        f"CÉL:\n{objective}\n\nSIKERTELEN MŰVELET:\n{clip(failed_action, 2000)}\n\nNYOMVONAL:\n{clip(trace, 10000)}",
+    user = (
+        f"CÉL:\n{clip(objective, 4000)}"
+        f"\n\nSIKERTELEN MŰVELET:\n{clip(failed_action, 2000)}"
+        f"\n\nNYOMVONAL:\n{clip_middle(trace, 10000, 0.2)}"
     )
-    parsed = extract_json(raw)
-    if not is_record(parsed):
-        raise AgentFault("COGNITIVE_INVALID_JSON", "A hibaelemző (reflect) érvénytelen JSON választ adott.", 502)
+    parsed = await think_json(
+        think,
+        system,
+        user,
+        "COGNITIVE_INVALID_JSON",
+        "A hibaelemző (reflect) érvénytelen JSON választ adott.",
+    )
 
     def required_text(key: str) -> str:
         value = parsed.get(key)
@@ -648,7 +857,8 @@ def fnv_hash(text: str) -> int:
     return value
 
 
-def embed(text: str) -> list[float]:
+@lru_cache(maxsize=4096)
+def embed_cached(text: str) -> tuple[float, ...]:
     vector = [0.0] * EMBED_DIM
     tokens = tokenize(text)
     for index, token in enumerate(tokens):
@@ -662,7 +872,11 @@ def embed(text: str) -> list[float]:
             trigram_position = fnv_hash(trigram) % EMBED_DIM
             vector[trigram_position] += 0.25
     norm = math.sqrt(sum(value * value for value in vector)) or 1.0
-    return [value / norm for value in vector]
+    return tuple(value / norm for value in vector)
+
+
+def embed(text: str) -> list[float]:
+    return list(embed_cached(text))
 
 
 def parse_vector(raw: Any) -> list[float]:
@@ -675,9 +889,11 @@ def parse_vector(raw: Any) -> list[float]:
                 result.append(float(item) if math.isfinite(float(item)) else 0.0)
             elif isinstance(item, str):
                 try:
-                    result.append(float(item))
+                    number = float(item)
                 except ValueError:
                     result.append(0.0)
+                else:
+                    result.append(number if math.isfinite(number) else 0.0)
             else:
                 result.append(0.0)
         return result
@@ -694,9 +910,11 @@ def parse_vector(raw: Any) -> list[float]:
             values: list[float] = []
             for part in inner.split(","):
                 try:
-                    values.append(float(part.strip()))
+                    number = float(part.strip())
                 except ValueError:
                     values.append(0.0)
+                else:
+                    values.append(number if math.isfinite(number) else 0.0)
             return values
         if isinstance(parsed, list):
             return parse_vector(parsed)
@@ -722,21 +940,33 @@ def cosine(left: Any, right: Any) -> float:
     return dot / denominator if denominator > 0 else 0.0
 
 
+def wilson_interval(successes: int, failures: int, z: float = 1.96) -> tuple[float, float]:
+    trials = successes + failures
+    if trials <= 0:
+        return 0.0, 1.0
+    proportion = successes / trials
+    denominator = 1 + (z * z) / trials
+    centre = proportion + (z * z) / (2 * trials)
+    margin = z * math.sqrt((proportion * (1 - proportion) + (z * z) / (4 * trials)) / trials)
+    return (
+        clamp((centre - margin) / denominator, 0.0, 1.0),
+        clamp((centre + margin) / denominator, 0.0, 1.0),
+    )
+
+
 async def retrieve(objective: str, context: str) -> dict[str, Any]:
     database = database_module.get_admin_database()
-    skills_response = await (
+    skills_response, playbooks_response = await asyncio.gather(
         database.table("agent_skills")
         .select("id", "name", "dsl", "terms", "vector", "successes", "failures")
         .eq("status", "active")
         .limit(500)
-        .execute()
-    )
-    playbooks_response = await (
+        .execute(),
         database.table("agent_playbooks")
         .select("content")
         .order("created_at", desc=True)
         .limit(1)
-        .execute()
+        .execute(),
     )
     skills = skills_response.rows
     playbooks = playbooks_response.rows
@@ -746,30 +976,49 @@ async def retrieve(objective: str, context: str) -> dict[str, Any]:
     ranked: list[tuple[Skill, float]] = []
     for row in skills:
         vector = parse_vector(row.get("vector"))
-        terms = tokenize(f"{row.get('name', '')} {row.get('terms', '')}")
+        terms = set(tokenize(f"{row.get('name') or ''} {row.get('terms') or ''}"))
         if terms:
             matched = len([term for term in terms if term in query_tokens])
             lexical = matched / math.sqrt(len(terms) * max(1, len(query_tokens)))
         else:
             lexical = 0.0
-        successes = int(row.get("successes") or 0)
-        failures = int(row.get("failures") or 0)
+        successes = max(0, to_int(row.get("successes")))
+        failures = max(0, to_int(row.get("failures")))
         rate = (successes + 1) / (successes + failures + 2)
         score = 0.5 * cosine(query_vector, vector) + 0.3 * min(1.0, lexical) + 0.2 * rate
         if score > 0.25:
             skill = Skill(
                 id=str(row.get("id")),
-                name=str(row.get("name")),
-                dsl=str(row.get("dsl")),
-                terms=str(row.get("terms")),
+                name=str(row.get("name") or ""),
+                dsl=str(row.get("dsl") or ""),
+                terms=str(row.get("terms") or ""),
                 vector=vector,
                 successes=successes,
                 failures=failures,
             )
             ranked.append((skill, score))
     ranked.sort(key=lambda entry: entry[1], reverse=True)
+    pool = list(ranked)
+    selected: list[tuple[Skill, float]] = []
+    while pool and len(selected) < 3:
+        best_index = 0
+        best_value = -math.inf
+        for position, (candidate, score) in enumerate(pool):
+            redundancy = max(
+                (cosine(candidate.vector, chosen.vector) for chosen, _ in selected),
+                default=0.0,
+            )
+            value = 0.7 * score - 0.3 * redundancy
+            if value > best_value:
+                best_value = value
+                best_index = position
+        selected.append(pool.pop(best_index))
     playbook = str(playbooks[0].get("content") or "") if playbooks else ""
-    return {"skills": [skill for skill, _ in ranked[:3]], "playbook": playbook}
+    return {
+        "skills": [skill for skill, _ in selected],
+        "playbook": playbook,
+        "scores": {skill.id: round(score, 4) for skill, score in selected},
+    }
 
 
 def ngrams(text: str) -> list[str]:
@@ -787,8 +1036,6 @@ def distribution(grams: list[str]) -> dict[str, float]:
 
 
 async def apply_policy_delta(ngram: str, delta: float) -> None:
-    from datetime import UTC, datetime
-
     database = database_module.get_admin_database()
     for _ in range(8):
         current = await (
@@ -807,7 +1054,7 @@ async def apply_policy_delta(ngram: str, delta: float) -> None:
                     .insert(
                         {
                             "ngram": ngram,
-                            "weight": delta,
+                            "weight": clamp(delta, -POLICY_WEIGHT_BOUND, POLICY_WEIGHT_BOUND),
                             "observations": 1,
                             "updated_at": now,
                         }
@@ -820,11 +1067,12 @@ async def apply_policy_delta(ngram: str, delta: float) -> None:
                     continue
                 raise
         row = rows[0]
-        observations = int(row.get("observations") or 0)
-        weight = float(row.get("weight") or 0.0)
+        observations = to_int(row.get("observations"))
+        weight = to_float(row.get("weight"))
+        new_weight = clamp(weight * POLICY_DECAY + delta, -POLICY_WEIGHT_BOUND, POLICY_WEIGHT_BOUND)
         updated = await (
             database.table("agent_policy_weights")
-            .update({"weight": weight + delta, "observations": observations + 1, "updated_at": now})
+            .update({"weight": new_weight, "observations": observations + 1, "updated_at": now})
             .eq("ngram", ngram)
             .eq("observations", observations)
             .execute()
@@ -875,21 +1123,19 @@ async def distill(pairs: list[dict[str, Any]]) -> None:
 
 async def policy_guidance() -> str:
     database = database_module.get_admin_database()
-    favor_response = await (
+    favor_response, avoid_response = await asyncio.gather(
         database.table("agent_policy_weights")
         .select("ngram", "weight")
         .gt("weight", 0.01)
         .order("weight", desc=True)
         .limit(8)
-        .execute()
-    )
-    avoid_response = await (
+        .execute(),
         database.table("agent_policy_weights")
         .select("ngram", "weight")
         .lt("weight", -0.01)
         .order("weight", desc=False)
         .limit(8)
-        .execute()
+        .execute(),
     )
     lines: list[str] = []
     favor = favor_response.rows
@@ -902,24 +1148,28 @@ async def policy_guidance() -> str:
 
 
 def valid_dsl(dsl: str) -> bool:
-    lines = [line.strip() for line in dsl.split("\n")]
+    lines = [line.strip() for line in dsl.split("\n") if line.strip()]
+    if not lines:
+        return False
 
     def has(keyword: str) -> bool:
         return any(
             line.startswith(f"{keyword} ") or line.startswith(f"{keyword}:") for line in lines
         )
 
-    return all(
-        has(keyword)
-        for keyword in ("SKILL", "WHEN", "REQUIRE", "STEP", "VERIFY", "RECOVER")
-    )
+    first = lines[0]
+    if not (first.startswith("SKILL ") or first.startswith("SKILL:")):
+        return False
+    return all(has(keyword) for keyword in DSL_KEYWORDS)
 
 
 def skill_solves(skill_tokens: set[str], skill_vector: list[float], task: dict[str, Any]) -> bool:
     needed = list(
         {
             token
-            for token in tokenize(f"{task.get('pivot_action', '')} {task.get('root_cause', '')}")
+            for token in tokenize(
+                f"{task.get('pivot_action') or ''} {task.get('root_cause') or ''}"
+            )
             if len(token) >= 4
         }
     )
@@ -928,7 +1178,7 @@ def skill_solves(skill_tokens: set[str], skill_vector: list[float], task: dict[s
     covered = len([token for token in needed if token in skill_tokens]) / len(needed)
     if covered < 0.5:
         return False
-    objective = f"{task.get('objective', '')}\n{task.get('root_cause', '')}"
+    objective = f"{task.get('objective') or ''}\n{task.get('root_cause') or ''}"
     return cosine(embed(objective), skill_vector) >= 0.2
 
 
@@ -936,16 +1186,14 @@ async def regression_gate(
     candidate: str, cluster_reflection_ids: set[str], cluster_task_ids: set[str], component: str
 ) -> dict[str, Any]:
     database = database_module.get_admin_database()
-    active_response = await (
-        database.table("agent_skills").select("dsl").eq("status", "active").limit(100).execute()
-    )
-    reflection_response = await (
+    active_response, reflection_response = await asyncio.gather(
+        database.table("agent_skills").select("dsl").eq("status", "active").limit(100).execute(),
         database.table("agent_reflections")
         .select("id", "task_id", "objective", "component", "root_cause", "pivot_action")
         .eq("component", component)
         .order("created_at", desc=True)
         .limit(200)
-        .execute()
+        .execute(),
     )
     seen_objectives: set[str] = set()
     held_out: list[dict[str, Any]] = []
@@ -989,14 +1237,14 @@ async def regression_gate(
 
 async def synthesize_skills(think: Think, log: Callable[[str], Awaitable[None]]) -> None:
     database = database_module.get_admin_database()
-    reflection_response = await (
+    reflection_response, skills_response = await asyncio.gather(
         database.table("agent_reflections")
         .select("id", "task_id", "component", "root_cause", "pivot_action", "patch", "objective")
         .order("created_at", desc=True)
         .limit(50)
-        .execute()
+        .execute(),
+        database.table("agent_skills").select("vector").limit(1000).execute(),
     )
-    skills_response = await database.table("agent_skills").select("vector").limit(1000).execute()
     items = [
         {
             **row,
@@ -1047,7 +1295,7 @@ async def synthesize_skills(think: Think, log: Callable[[str], Awaitable[None]])
             f"JAVÍTÁS: {item.get('patch')}"
             for item in group
         )
-        dsl = re.sub(r"```[a-z]*\n?|```", "", await think(system, user_prompt)).strip()
+        dsl = re.sub(r"```[a-z]*\n?|```", "", await call_think(think, system, user_prompt)).strip()
         if not valid_dsl(dsl):
             await log("A szintetizált képesség érvénytelen DSL-t adott, elvetve.")
             continue
@@ -1055,7 +1303,7 @@ async def synthesize_skills(think: Think, log: Callable[[str], Awaitable[None]])
         name = (
             name_match.group(1).strip()[:80]
             if name_match
-            else f"skill_{abs(hash(dsl)) % 10**10:010x}"
+            else f"skill_{hashlib.sha256(dsl.encode('utf-8')).hexdigest()[:10]}"
         )
         gate_result = await regression_gate(
             dsl,
@@ -1086,9 +1334,46 @@ async def synthesize_skills(think: Think, log: Callable[[str], Awaitable[None]])
         )
 
 
+async def prune_skills(log: Callable[[str], Awaitable[None]]) -> None:
+    database = database_module.get_admin_database()
+    response = await (
+        database.table("agent_skills")
+        .select("id", "name", "successes", "failures")
+        .eq("status", "active")
+        .limit(500)
+        .execute()
+    )
+    for row in response.rows:
+        successes = max(0, to_int(row.get("successes")))
+        failures = max(0, to_int(row.get("failures")))
+        if successes + failures < SKILL_RETIRE_MIN_TRIALS:
+            continue
+        _, upper = wilson_interval(successes, failures)
+        if upper >= SKILL_RETIRE_UPPER_BOUND:
+            continue
+        updated = await (
+            database.table("agent_skills")
+            .update({"status": "rejected"})
+            .eq("id", str(row.get("id")))
+            .eq("status", "active")
+            .execute()
+        )
+        if updated.rows:
+            await log(
+                f"A képesség visszavonva a tartósan alacsony sikerarány miatt: {row.get('name') or row.get('id')}."
+            )
+
+
 async def evolve_playbook(think: Think, log: Callable[[str], Awaitable[None]]) -> None:
     database = database_module.get_admin_database()
-    total = await database.table("agent_tasks").select("id", count="exact", head=True).count_exact()
+    tasks_query = database.table("agent_tasks").select("id", count="exact", head=True)
+    count_method = getattr(tasks_query, "count_exact", None)
+    if callable(count_method):
+        count_res = await count_method()
+        total = to_int(getattr(count_res, "count", count_res))
+    else:
+        tasks_response = await tasks_query.execute()
+        total = to_int(getattr(tasks_response, "count", len(getattr(tasks_response, "rows", []))))
     last_response = await (
         database.table("agent_playbooks")
         .select("task_count")
@@ -1098,25 +1383,21 @@ async def evolve_playbook(think: Think, log: Callable[[str], Awaitable[None]]) -
     )
     last_count = 0
     if last_response.rows:
-        last_count = int(last_response.rows[0].get("task_count") or 0)
+        last_count = to_int(last_response.rows[0].get("task_count"))
     if total - last_count < 5:
         return
-    reflection_response = await (
+    reflection_response, skills_response, previous_response = await asyncio.gather(
         database.table("agent_reflections")
         .select("component", "root_cause", "pivot_action")
         .order("created_at", desc=True)
         .limit(40)
-        .execute()
-    )
-    skills_response = await (
-        database.table("agent_skills").select("name", "dsl").eq("status", "active").limit(20).execute()
-    )
-    previous_response = await (
+        .execute(),
+        database.table("agent_skills").select("name", "dsl").eq("status", "active").limit(20).execute(),
         database.table("agent_playbooks")
         .select("content")
         .order("created_at", desc=True)
         .limit(1)
-        .execute()
+        .execute(),
     )
     system = (
         "Tapasztalati tudáskonszolidátor vagy. Írj tömör, ember által olvasható magyar működési "
@@ -1128,14 +1409,19 @@ async def evolve_playbook(think: Think, log: Callable[[str], Awaitable[None]]) -
         for row in reflection_response.rows
     )
     active_skills = "\n\n".join(str(row.get("dsl") or "") for row in skills_response.rows)
-    previous_content = str(previous_response.rows[0].get("content") or "nincs") if previous_response.rows else "nincs"
+    previous_content = (
+        str(previous_response.rows[0].get("content") or "nincs") if previous_response.rows else "nincs"
+    )
     content = (
-        await think(
+        await call_think(
+            think,
             system,
             f"ELŐZŐ KÉZIKÖNYV:\n{previous_content}\n\nREFLEXIÓK:\n{reflections}\n\nAKTÍV KÉPESSÉGEK:\n{active_skills}",
         )
     ).strip()
     if not content:
+        return
+    if content == previous_content.strip():
         return
     inserted = await (
         database.table("agent_playbooks")
@@ -1172,8 +1458,8 @@ async def record_skill_outcome(skill_id: str, verified: bool) -> None:
         if not current.rows:
             return
         row = current.rows[0]
-        successes = int(row.get("successes") or 0)
-        failures = int(row.get("failures") or 0)
+        successes = to_int(row.get("successes"))
+        failures = to_int(row.get("failures"))
         patch = (
             {"successes": successes + 1} if verified else {"failures": failures + 1}
         )
@@ -1194,6 +1480,16 @@ async def record_skill_outcome(skill_id: str, verified: bool) -> None:
     )
 
 
+def normalize_reflection(item: Any) -> dict[str, str] | None:
+    if isinstance(item, Reflection):
+        source = asdict(item)
+    elif isinstance(item, dict):
+        source = item
+    else:
+        return None
+    return {key: clip(str(source.get(key) or ""), 2000) for key in REFLECTION_FIELDS}
+
+
 async def consolidate(
     think: Think,
     payload: dict[str, Any],
@@ -1203,10 +1499,19 @@ async def consolidate(
     task_id = str(payload.get("taskId") or "")
     objective = str(payload.get("objective") or "")
     outcome = str(payload.get("outcome") or "")
-    steps = int(payload.get("steps") or 0)
+    steps = max(0, to_int(payload.get("steps")))
     verified = bool(payload.get("verified"))
-    reflections = payload.get("reflections") or []
-    used_skills = payload.get("usedSkills") or []
+    raw_reflections = payload.get("reflections")
+    reflections = [
+        normalized
+        for normalized in (
+            normalize_reflection(item)
+            for item in (raw_reflections if isinstance(raw_reflections, list) else [])
+        )
+        if normalized is not None
+    ]
+    raw_skills = payload.get("usedSkills")
+    used_skills = raw_skills if isinstance(raw_skills, list) else []
     await (
         database.table("agent_tasks")
         .upsert(
@@ -1222,42 +1527,54 @@ async def consolidate(
         .execute()
     )
     if reflections:
-        rows = []
-        for reflection in reflections:
-            rows.append(
-                {
-                    "task_id": task_id,
-                    "objective": clip(objective, 4000),
-                    "failure_point": reflection.get("failure_point", ""),
-                    "component": reflection.get("component", ""),
-                    "root_cause": reflection.get("root_cause", ""),
-                    "pivot_action": reflection.get("pivot_action", ""),
-                    "patch": reflection.get("patch", ""),
-                    "failed_action": reflection.get("failed_action", ""),
-                    "corrective_action": reflection.get("corrective_action", ""),
-                }
-            )
+        rows = [
+            {
+                "task_id": task_id,
+                "objective": clip(objective, 4000),
+                "failure_point": reflection["failure_point"],
+                "component": reflection["component"],
+                "root_cause": reflection["root_cause"],
+                "pivot_action": reflection["pivot_action"],
+                "patch": reflection["patch"],
+                "failed_action": reflection["failed_action"],
+                "corrective_action": reflection["corrective_action"],
+            }
+            for reflection in reflections
+        ]
         await database.table("agent_reflections").insert(rows).execute()
         await distill(
             [
                 {
-                    "failed": reflection.get("failed_action", ""),
-                    "corrective": reflection.get("corrective_action", ""),
+                    "failed": reflection["failed_action"],
+                    "corrective": reflection["corrective_action"],
                     "advantage": 1 if verified else 0.25,
                 }
                 for reflection in reflections
-                if reflection.get("corrective_action")
+                if reflection["corrective_action"]
             ]
         )
     for skill_id in dict.fromkeys(str(item) for item in used_skills):
         await record_skill_outcome(skill_id, verified)
     async with _db_write_lock:
+        errors: list[Exception] = []
         if reflections:
-            await synthesize_skills(think, log)
-        await evolve_playbook(think, log)
+            try:
+                await synthesize_skills(think, log)
+            except Exception as exc:
+                errors.append(exc)
+        try:
+            await prune_skills(log)
+        except Exception as exc:
+            errors.append(exc)
+        try:
+            await evolve_playbook(think, log)
+        except Exception as exc:
+            errors.append(exc)
+        if errors:
+            raise errors[0]
 
 
-async def take_operator_messages(task_id: str) -> list[Any]:
+async def take_operator_messages(task_id: str) -> list[str]:
     database = database_module.get_admin_database()
     response = await (
         database.table("agent_operator_messages")
@@ -1267,65 +1584,75 @@ async def take_operator_messages(task_id: str) -> list[Any]:
         .execute()
     )
     rows = sorted(response.rows, key=lambda row: str(row.get("created_at") or ""))
-    return [
-        row.get("content")
-        if isinstance(row.get("content"), (str, list))
-        else str(row.get("content") or "")
-        for row in rows
-    ]
+    return [str(row.get("content") or "") for row in rows]
 
 
-async def post_operator_message(task_id: str, content: Any) -> None:
+async def post_operator_message(task_id: str, content: str) -> None:
+    if not content or not content.strip():
+        raise AgentFault("INVALID_ARGUMENT", "Az operátori üzenet nem lehet üres.", 400)
     database = database_module.get_admin_database()
-    if isinstance(content, str):
-        stored_content: Any = clip(content, 4_000_000)
-    elif isinstance(content, list):
-        stored_content = []
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            copied = dict(part)
-            if copied.get("type") == "text" and isinstance(copied.get("text"), str):
-                copied["text"] = clip(copied["text"], 400_000)
-            stored_content.append(copied)
-    else:
-        raise AgentFault("INVALID_OPERATOR_MESSAGE", "The operator message is invalid.", 400)
     await (
         database.table("agent_operator_messages")
-        .insert({"task_id": task_id, "content": stored_content})
+        .insert({"task_id": task_id, "content": clip(content.strip(), 8000)})
         .execute()
     )
 
 
-async def reason_node(think: Think, question: str, depth: int, branches: int) -> ReasonNode:
+async def reason_node(
+    think: Think,
+    question: str,
+    depth: int,
+    branches: int,
+    cache: dict[tuple[str, int], "asyncio.Future[ReasonNode]"] | None = None,
+) -> ReasonNode:
+    if cache is None:
+        cache = {}
+    key = (question, depth)
+    existing = cache.get(key)
+    if existing is not None:
+        return await existing
+    task = asyncio.ensure_future(expand_reason_node(think, question, depth, branches, cache))
+    cache[key] = task
+    return await task
+
+
+async def expand_reason_node(
+    think: Think,
+    question: str,
+    depth: int,
+    branches: int,
+    cache: dict[tuple[str, int], "asyncio.Future[ReasonNode]"],
+) -> ReasonNode:
     if depth <= 0:
-        answer = await think(
-            "Izolált következtető vagy. Tömören, tényszerűen válaszolj a kérdésre; ne javasolj állapotmódosítást.",
-            question,
-        )
+        answer = await call_think(think, ATOMIC_REASONER_SYSTEM, question)
         return ReasonNode(question=question, answer=clip(answer, 3000), children=[])
-    decomposition = await think(
+    decomposition = await call_think(
+        think,
         f"Bontsd a kérdést legfeljebb {branches} független, kisebb alkérdésre. "
         "Csak JSON tömböt adj vissza stringekkel. Ha a kérdés atomi, adj vissza üres tömböt.",
         question,
     )
-    sub_questions = collect_strings(extract_json(decomposition), branches)
-    children = [
-        await reason_node(think, sub_question, depth - 1, branches)
-        for sub_question in sub_questions
-    ]
+    sub_questions = list(
+        dict.fromkeys(collect_strings(extract_json(decomposition, list), branches))
+    )
+    children = list(
+        await asyncio.gather(
+            *(
+                reason_node(think, sub_question, depth - 1, branches, cache)
+                for sub_question in sub_questions
+            )
+        )
+    )
     if children:
-        answer = await think(
+        answer = await call_think(
+            think,
             "Összegző vagy. Az alkérdésekre adott válaszokból adj tömör, következetes választ az eredeti kérdésre.",
             "EREDETI KÉRDÉS:\n"
             f"{question}\n\nALVÁLASZOK:\n"
             + "\n".join(f"- {child.question}: {child.answer}" for child in children),
         )
     else:
-        answer = await think(
-            "Izolált következtető vagy. Tömören, tényszerűen válaszolj a kérdésre; ne javasolj állapotmódosítást.",
-            question,
-        )
+        answer = await call_think(think, ATOMIC_REASONER_SYSTEM, question)
     return ReasonNode(question=question, answer=clip(answer, 3000), children=children)
 
 
@@ -1337,16 +1664,46 @@ def reason_node_to_dict(node: ReasonNode) -> dict[str, Any]:
     }
 
 
+def flatten_reason_tree(node: ReasonNode) -> list[ReasonNode]:
+    collected = [node]
+    for child in node.children:
+        collected.extend(flatten_reason_tree(child))
+    return collected
+
+
+def reason_tree_stats(node: ReasonNode) -> dict[str, int]:
+    def measure(current: ReasonNode) -> int:
+        if not current.children:
+            return 0
+        return 1 + max(measure(child) for child in current.children)
+
+    flat = flatten_reason_tree(node)
+    return {
+        "nodes": len(flat),
+        "leaves": len([item for item in flat if not item.children]),
+        "depth": measure(node),
+    }
+
+
 async def reason_tree(think: Think, question: str, depth: int, branches: int) -> ReasonNode:
-    if depth < 0 or depth > REASON_MAX_DEPTH:
+    if not isinstance(question, str) or not question.strip():
+        raise AgentFault("INVALID_ARGUMENT", "A kérdés nem lehet üres.", 400)
+    if isinstance(depth, bool) or not isinstance(depth, int) or depth < 0 or depth > REASON_MAX_DEPTH:
         raise AgentFault(
             "INVALID_ARGUMENT",
             f"Érvénytelen mélység: 0 és {REASON_MAX_DEPTH} közötti egész szám szükséges.",
+            400,
         )
-    if branches < 1 or branches > REASON_MAX_BRANCHES:
+    if (
+        isinstance(branches, bool)
+        or not isinstance(branches, int)
+        or branches < 1
+        or branches > REASON_MAX_BRANCHES
+    ):
         raise AgentFault(
             "INVALID_ARGUMENT",
             f"Érvénytelen elágazásszám: 1 és {REASON_MAX_BRANCHES} közötti egész szám szükséges.",
+            400,
         )
     nodes = 0
     level = 1
@@ -1357,23 +1714,106 @@ async def reason_tree(think: Think, question: str, depth: int, branches: int) ->
         raise AgentFault(
             "INVALID_ARGUMENT",
             f"A kért fa legfeljebb {nodes * 2} modellhívást igényelhet, a korlát {REASON_MAX_CALLS}.",
+            400,
         )
-    return await reason_node(think, question, depth, branches)
+    cache: dict[tuple[str, int], "asyncio.Future[ReasonNode]"] = {}
+    try:
+        return await reason_node(think, question.strip(), depth, branches, cache)
+    except BaseException:
+        for task in cache.values():
+            task.cancel()
+        raise
+
+
+def sigma_fingerprint(sigma: Sigma) -> str:
+    canonical = json.dumps(
+        sigma.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def sigma_diff(before: Sigma, after: Sigma) -> dict[str, Any]:
+    before_facts = set(before.facts)
+    after_facts = set(after.facts)
+    before_blockers = set(before.blockers)
+    after_blockers = set(after.blockers)
+    before_ids = {item.id for item in before.subgoals}
+    after_ids = {item.id for item in after.subgoals}
+    return {
+        "facts_added": [item for item in after.facts if item not in before_facts],
+        "facts_removed": [item for item in before.facts if item not in after_facts],
+        "blockers_added": [item for item in after.blockers if item not in before_blockers],
+        "blockers_resolved": [item for item in before.blockers if item not in after_blockers],
+        "subgoals_added": [item.id for item in after.subgoals if item.id not in before_ids],
+        "subgoals_removed": [item.id for item in before.subgoals if item.id not in after_ids],
+        "closed_delta": after.closed_subgoals - before.closed_subgoals,
+        "gate_delta": after.gate - before.gate,
+        "decision_changed": before.decision != after.decision,
+    }
+
+
+def completion_ratio(sigma: Sigma) -> float:
+    total = sigma.closed_subgoals + len(sigma.subgoals)
+    if total <= 0:
+        return 0.0
+    done = len([item for item in sigma.subgoals if item.done])
+    return clamp((sigma.closed_subgoals + done) / total, 0.0, 1.0)
+
+
+def detect_loop(actions: list[str], window: int = 4) -> bool:
+    normalized = [re.sub(r"\s+", " ", item.strip().lower()) for item in actions]
+    if window < 2 or len(normalized) < window:
+        return False
+    recent = normalized[-window:]
+    if len(set(recent)) == 1:
+        return True
+    if window >= 4 and window % 2 == 0 and recent[0] != recent[1]:
+        return all(recent[index] == recent[index % 2] for index in range(window))
+    return False
 
 
 class Lifecycle:
     def __init__(self, on_change: Callable[[str, str], Awaitable[None]]):
         self.phase = "osPerceive"
         self.trail: list[str] = ["osPerceive"]
+        self.timeline: list[dict[str, Any]] = [
+            {"phase": "osPerceive", "entered_at": time.monotonic()}
+        ]
         self._on_change = on_change
+        self._lock = asyncio.Lock()
+
+    @property
+    def terminal(self) -> bool:
+        return not TRANSITIONS.get(self.phase, ())
+
+    @property
+    def allowed(self) -> tuple[str, ...]:
+        return TRANSITIONS.get(self.phase, ())
+
+    def can_transition(self, next_phase: str) -> bool:
+        return next_phase in TRANSITIONS.get(self.phase, ())
+
+    def visits(self, phase: str) -> int:
+        return len([item for item in self.trail if item == phase])
+
+    def durations(self) -> dict[str, float]:
+        totals: dict[str, float] = {}
+        now = time.monotonic()
+        for index, entry in enumerate(self.timeline):
+            end = self.timeline[index + 1]["entered_at"] if index + 1 < len(self.timeline) else now
+            totals[entry["phase"]] = totals.get(entry["phase"], 0.0) + (end - entry["entered_at"])
+        return totals
 
     async def to(self, next_phase: str) -> None:
-        if next_phase not in TRANSITIONS.get(self.phase, ()):
-            raise AgentFault(
-                "INVALID_PHASE_TRANSITION",
-                f"Tiltott fázisátmenet: {self.phase} -> {next_phase}",
-            )
-        previous = self.phase
-        await self._on_change(previous, next_phase)
-        self.phase = next_phase
-        self.trail.append(next_phase)
+        async with self._lock:
+            if next_phase not in TRANSITIONS.get(self.phase, ()):
+                raise AgentFault(
+                    "INVALID_PHASE_TRANSITION",
+                    f"Tiltott fázisátmenet: {self.phase} -> {next_phase}",
+                    400,
+                )
+            previous = self.phase
+            await self._on_change(previous, next_phase)
+            self.phase = next_phase
+            self.trail.append(next_phase)
+            self.timeline.append({"phase": next_phase, "entered_at": time.monotonic()})

@@ -328,8 +328,8 @@
     var width=rect.width>0?rect.width:1280;
     var height=rect.height>0?rect.height:1029;
     return {
-      x:clamp((event.clientX-rect.left)*1280/width,0,1280),
-      y:clamp((event.clientY-rect.top)*1029/height,0,1029)
+      x:clamp((event.clientX-rect.left)*1280/width,0,1279),
+      y:clamp((event.clientY-rect.top)*1029/height,0,1028)
     };
   }
   function clickCountFor(coords,type){

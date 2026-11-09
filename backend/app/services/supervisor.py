@@ -498,6 +498,8 @@ class Supervisor:
         except httpx.HTTPError as exc:
             return False, f"{name} hálózati hiba: {exc}", self._elapsed(started)
         latency = self._elapsed(started)
+        if response.status_code in (401, 403):
+            return False, f"{name} HTTP {response.status_code}", latency
         if response.status_code >= accept_below:
             return False, f"{name} HTTP {response.status_code}", latency
         return True, "", latency
@@ -1130,7 +1132,9 @@ class Supervisor:
 
     def _log_action(self, kind: str, job_id: str, detail: str, result: dict[str, Any]) -> None:
         action = self.metrics.add_action(kind, job_id, detail)
-        as_list(result.get("actions")).append(action.to_payload())
+        if "actions" not in result or not isinstance(result["actions"], list):
+            result["actions"] = []
+        result["actions"].append(action.to_payload())
         if self._recovery_log is False:
             return
         self._retain(self._persist_action(action))

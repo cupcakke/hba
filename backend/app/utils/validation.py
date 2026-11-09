@@ -209,11 +209,49 @@ def validate_client_content(value: Any) -> str | list[dict[str, Any]]:
     return validated
 
 
+def _merge_contents(a: Any, b: Any) -> Any:
+    # Merge two content values (string or list of parts)
+    if isinstance(a, str) and isinstance(b, str):
+        return a + "\n\n" + b if a and b else a or b
+    # Convert to list representation
+    def to_list(v: Any) -> list[dict[str, Any]]:
+        if isinstance(v, str):
+            return [{"type": "text", "text": v}] if v else []
+        if isinstance(v, list):
+            return v
+        return []
+    return to_list(a) + to_list(b)
+
+def normalize_client_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for raw in messages:
+        if not isinstance(raw, dict):
+            continue
+        role = raw.get("role")
+        content = raw.get("content")
+        # Drop empty assistant messages
+        if role == "assistant":
+            txt = content_text(content)
+            if not txt.strip() and not (isinstance(content, list) and any(p.get("type") in ("image_url", "input_image") for p in content if isinstance(p, dict))):
+                continue
+        if normalized and normalized[-1].get("role") == role:
+            # Merge consecutive same-role
+            prev = normalized[-1]
+            merged = _merge_contents(prev.get("content"), content)
+            prev["content"] = merged
+        else:
+            normalized.append({"role": role, "content": content})
+    return normalized
+
 def validate_client_history(payload: Any) -> list[dict[str, Any]]:
     if not is_record(payload):
         raise RequestFault("Hiányzó vagy hibás üzenetlista.")
     messages = payload.get("messages")
     if not isinstance(messages, list) or not 1 <= len(messages) <= MAX_HISTORY_MESSAGES:
+        raise RequestFault("Hiányzó vagy hibás üzenetlista.")
+    # Pre-normalize to handle redirect duplicates and empty assistant
+    messages = normalize_client_messages(messages)
+    if not messages:
         raise RequestFault("Hiányzó vagy hibás üzenetlista.")
     validated: list[dict[str, Any]] = []
     last_role: str | None = None
@@ -229,8 +267,12 @@ def validate_client_history(payload: Any) -> list[dict[str, Any]]:
             raise RequestFault("Az üzenet szerepköre nem megengedett.")
         if last_role is None and role != "user":
             raise RequestFault("Az első üzenetnek felhasználói üzenetnek kell lennie.")
+        # Allow consecutive same-role after normalization should not happen, but if it does, merge instead of error
         if last_role is not None and role == last_role:
-            raise RequestFault("Az üzenetek szerepkörének váltakoznia kell.")
+            # Merge with previous validated entry
+            prev = validated[-1]
+            prev["content"] = _merge_contents(prev["content"], validate_client_content(raw.get("content")))
+            continue
         content = validate_client_content(raw.get("content"))
         total_length += content_text_length(content)
         if total_length > MAX_TOTAL_TEXT_LENGTH:

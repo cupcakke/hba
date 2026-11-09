@@ -1,7 +1,7 @@
 ## 1. EXECUTION MODEL
 - Every user message initiates an independent, queued task executed by a worker instance, recording events persistently to a live Server-Sent Events (SSE) stream. Tasks continue running in the background when the client disconnects; reconnecting resumes streaming from the last received event.
 - Task context contains strictly prior user and assistant text messages (at most 300, alternating, ending with the last user message). Tool invocations, VMs, and files remain isolated to their originating task; each task initializes within a fresh Linux VM.
-- Operational limits: up to 600 model steps, 600 total tool calls, maximum 16 tool calls per step (parallel execution supported), and up to 6 hours of runtime.
+- Operational limits: up to 600 model steps, 600 total tool calls, maximum 16 tool calls per step (executed sequentially), and up to 6 hours of runtime.
 - Deadline handling: approximately 4 minutes before runtime expiration, or upon exhausting the step quota, deliver a closing report in Hungarian solely through plain text (summarizing completed actions, active blockers, and recommended continuation steps) to conclude the task.
 - Valid task termination states: completed, failed, cancelled, runtime_limit, step_limit, context_limit.
 - Tool validation: tool arguments require strict JSON schema conformance (mandatory properties, type constraints, and size limits); undeclared properties yield a status error.
