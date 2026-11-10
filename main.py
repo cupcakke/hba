@@ -80,7 +80,6 @@ FLYMYAI_BASE_URL = _text_env("FLYMYAI_BASE_URL", "https://api.flymy.ai")
 FLYMYAI_IMAGE_MODEL = _text_env("FLYMYAI_IMAGE_MODEL", "flymyai/nano-banana-2_1")
 CHUNK_CHARS = _int_env("HBA_CHUNK_CHARS", 120000)
 NIX_INSTALLER_URL = _text_env("NIX_INSTALLER_URL", "https://nixos.org/nix/install")
-NIX_INSTALLER_SHA256 = _text_env("NIX_INSTALLER_SHA256")
 SERVER_PORT = _int_env("PORT", 5000)
 APP_STARTED_AT = time.time()
 
@@ -415,10 +414,11 @@ class ChatModel:
                     self.minimal = True
                     attempt += 1
                     continue
-                attempt += 1
-                if attempt > 100:
+                status = getattr(exc, "status_code", None)
+                if status is not None and 400 <= int(status) < 500 and int(status) != 429:
                     raise AgentFailure(str(exc)) from exc
-                await asyncio.sleep(min(30.0, 1.25 ** attempt))
+                attempt += 1
+                await asyncio.sleep(2.0)
 
     async def stream_turn(self, messages: Sequence[dict[str, Any]], tools: Sequence[dict[str, Any]] | None, on_delta: Any) -> "ModelTurn":
         stream = await self._create(messages, tools, True)
@@ -626,7 +626,7 @@ class ZepMemory:
 
     def _messages_sync(self, thread_uuid: str) -> list[dict[str, Any]]:
         client = self._client()
-        pager = client.thread.list_messages(thread_uuid, page_size=100, order="asc")
+        pager = client.thread.list_messages(thread_uuid, order="asc")
         messages: list[dict[str, Any]] = []
         for message in pager:
             payload = message.dict() if hasattr(message, "dict") else dict(message)
@@ -705,7 +705,7 @@ class ZepMemory:
         if self.user_node.get("summary"):
             result["user_summary"] = str(self.user_node.get("summary"))
         try:
-            pager = client.graph.search_edges(self.user_uuid, query=query, page_size=100)
+            pager = client.graph.search_edges(self.user_uuid, query=query)
             for edge in pager:
                 payload = edge.dict() if hasattr(edge, "dict") else dict(edge)
                 fact = str(payload.get("fact") or "").strip()
@@ -722,7 +722,7 @@ class ZepMemory:
     def _search_sync(self, query: str) -> list[dict[str, Any]]:
         client = self._client()
         results: list[dict[str, Any]] = []
-        pager = client.graph.search_edges(self.user_uuid, query=query, page_size=100)
+        pager = client.graph.search_edges(self.user_uuid, query=query)
         for edge in pager:
             payload = edge.dict() if hasattr(edge, "dict") else dict(edge)
             results.append(
@@ -757,7 +757,7 @@ class ZepMemory:
 
     def _threads_sync(self) -> list[dict[str, Any]]:
         client = self._client()
-        pager = client.thread.list(user_uuid=self.user_uuid, page_size=100)
+        pager = client.thread.list(user_uuid=self.user_uuid)
         payloads: list[dict[str, Any]] = []
         for thread in pager:
             payload = thread.dict() if hasattr(thread, "dict") else dict(thread)
@@ -1090,15 +1090,11 @@ class VmSession:
             return self
 
     def bootstrap_command(self) -> str:
-        checksum = ""
-        if NIX_INSTALLER_SHA256:
-            checksum = "if ! printf '%s  /tmp/nix-install' \"" + NIX_INSTALLER_SHA256 + "\" | sha256sum -c - >/dev/null 2>&1; then echo nix-installer-checksum-failed; fi; "
         return (
             "set -e; mkdir -p \"$HOME/workspace\" \"$HOME/workspace/attachments\" \"$HOME/workspace/outputs\" \"$HOME/frames\"; "
             "export PATH=\"$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:$PATH\"; "
             "if ! command -v nix >/dev/null 2>&1; then "
             "curl -fsSL " + shlex.quote(NIX_INSTALLER_URL) + " -o /tmp/nix-install || true; "
-            + checksum
             + "sh /tmp/nix-install --no-daemon --yes || sh /tmp/nix-install --daemon --yes || true; "
             "fi; "
             "if ! command -v nix >/dev/null 2>&1; then "
@@ -1209,7 +1205,7 @@ async def cdp_websocket_url(cdp_url: str) -> str:
     if value.startswith("http://") or value.startswith("https://"):
         parts = urlsplit(value)
         version_url = parts._replace(path=parts.path.rstrip("/") + "/json/version").geturl()
-        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=None, write=None, pool=None), follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
             response = await client.get(version_url)
             response.raise_for_status()
             payload = response.json()
@@ -1222,7 +1218,7 @@ async def cdp_websocket_url(cdp_url: str) -> str:
 
 async def cdp_call(cdp_url: str, method: str, params: dict[str, Any] | None = None, page_required: bool = True) -> dict[str, Any]:
     websocket_url = await cdp_websocket_url(cdp_url)
-    async with websockets.connect(websocket_url, max_size=None, open_timeout=45, ping_interval=20, ping_timeout=20) as socket:
+    async with websockets.connect(websocket_url, max_size=None, open_timeout=None, ping_interval=None, ping_timeout=None) as socket:
         counter = 0
 
         async def send(command: str, payload: dict[str, Any] | None = None, session_id: str | None = None) -> dict[str, Any]:
@@ -1266,8 +1262,6 @@ class BrowserHandle:
         self.status = "starting"
         self.lock = asyncio.Lock()
         self.frame_lock = asyncio.Lock()
-        self.frame_data = ""
-        self.frame_time = 0.0
         self.created_at = utc_now()
         self.last_used = time.time()
 
@@ -1305,9 +1299,6 @@ class BrowserHandle:
 
     async def capture(self) -> str:
         async with self.frame_lock:
-            now = time.time()
-            if self.frame_data and now - self.frame_time < 0.35:
-                return self.frame_data
             url = self.cdp_url()
             if not url:
                 raise ToolFailure("A böngésző élő nézete nem érhető el ehhez a munkamenethez.")
@@ -1319,9 +1310,7 @@ class BrowserHandle:
             data = result.get("data")
             if not data:
                 raise ToolFailure("A böngésző nem adott képernyőképet.")
-            self.frame_data = str(data)
-            self.frame_time = now
-            return self.frame_data
+            return str(data)
 
     async def mouse(self, payload: dict[str, Any]) -> dict[str, Any]:
         url = self.cdp_url()
@@ -1396,7 +1385,6 @@ class BrowserHandle:
         self.status = "stopped"
         self.browser = None
         self.id = ""
-        self.frame_data = ""
 
 
 class BrowserManager:
@@ -1740,7 +1728,7 @@ class AttachmentProcessor:
         return "- " + entry["name"] + " | " + entry["mime_type"] + " | " + str(entry["size"]) + " bytes | artifact " + entry["artifact_id"] + " | " + ARTIFACTS.url(entry["artifact_id"]) + " | VM " + str(entry.get("vm_path", ""))
 
     async def fetch_url_bytes(self, url: str, name: str) -> tuple[bytes, str]:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=None, write=None, pool=None), follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
             async with client.stream("GET", url) as response:
                 response.raise_for_status()
                 data = b"".join([chunk async for chunk in response.aiter_bytes()])
@@ -2004,7 +1992,6 @@ class AgentContext:
         thread_uuid: str,
         objective: str,
         vm: VmSession,
-        allow_subagent: bool = True,
         role: str = "lead agent",
     ) -> None:
         self.job = job
@@ -2013,7 +2000,6 @@ class AgentContext:
         self.thread_uuid = thread_uuid
         self.objective = objective
         self.vm = vm
-        self.allow_subagent = allow_subagent
         self.role = role
         self.finished = False
         self.final_answer = ""
@@ -2169,8 +2155,6 @@ class AgentContext:
             await self.job.progress(self.plan)
             return {"status": "completed", "plan": self.plan}
         if name == "subagent":
-            if not self.allow_subagent:
-                raise ToolFailure("A szubügynök nem indíthat további szubügynököt.")
             return await self.run_subagent(str(arguments.get("role") or "specialist"), str(arguments.get("objective") or ""), str(arguments.get("context") or ""))
         if name == "self_improve":
             lesson = str(arguments.get("lesson") or "").strip()
@@ -2195,7 +2179,7 @@ class AgentContext:
         headers = arguments.get("headers") if isinstance(arguments.get("headers"), dict) else {}
         body = arguments.get("body")
         payload = body.encode("utf-8") if isinstance(body, str) and body else None
-        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=None, write=None, pool=None), follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
             async with client.stream(method, url, headers=headers, content=payload) as response:
                 chunks = [chunk async for chunk in response.aiter_bytes()]
                 data = b"".join(chunks)
@@ -2221,7 +2205,7 @@ class AgentContext:
     async def run_subagent(self, role: str, objective: str, context: str) -> dict[str, Any]:
         if not objective:
             raise ToolFailure("A szubügynök feladata hiányzik.")
-        child = AgentContext(self.job, self.model, self.conversation_id, self.thread_uuid, objective, self.vm, False, role)
+        child = AgentContext(self.job, self.model, self.conversation_id, self.thread_uuid, objective, self.vm, role)
         system = (
             "You are the " + role + " subagent of an autonomous agent. You have direct access to a Nix virtual machine, "
             "a Browser Use browser driven by the Hopper model, web fetching, artifacts and the persistent Zep memory. "
@@ -2568,7 +2552,7 @@ async def flymyai_predict(fields: dict[str, str], files: list[tuple[str, tuple[s
     url = FLYMYAI_BASE_URL.rstrip("/") + "/api/v1/" + FLYMYAI_IMAGE_MODEL + "/predict"
     headers = {"X-API-KEY": FLYMYAI_API_KEY}
     output: dict[str, Any] | None = None
-    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=None, write=None, pool=None), follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
         async with client.stream("POST", url, headers=headers, data=fields, files=files or None) as response:
             if response.status_code >= 400:
                 body = (await response.aread()).decode("utf-8", errors="replace")
@@ -2614,7 +2598,7 @@ async def image_result_artifact(url: str, index: int, conversation_id: str) -> d
     if url.startswith("/api/artifacts/"):
         artifact_id = unquote(url.rsplit("/", 1)[-1])
         return ARTIFACTS.entry(artifact_id)
-    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=None, write=None, pool=None), follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
         async with client.stream("GET", url) as response:
             response.raise_for_status()
             data = b"".join([chunk async for chunk in response.aiter_bytes()])
@@ -2637,7 +2621,7 @@ async def reference_bytes(value: Any) -> tuple[str, bytes, str] | None:
         entry = ARTIFACTS.entry(unquote(text.rsplit("/", 1)[-1]))
         return entry["name"], ARTIFACTS.path(entry["artifact_id"]).read_bytes(), entry["mime_type"]
     if text.startswith("http://") or text.startswith("https://"):
-        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=None, write=None, pool=None), follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
             async with client.stream("GET", text) as response:
                 response.raise_for_status()
                 data = b"".join([chunk async for chunk in response.aiter_bytes()])
@@ -3092,4 +3076,4 @@ app.mount("/", StaticFiles(directory=str(PUBLIC_DIR), html=False), name="public"
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=SERVER_PORT, log_level="info", timeout_graceful_shutdown=30)
+    uvicorn.run(app, host="0.0.0.0", port=SERVER_PORT, log_level="info")
