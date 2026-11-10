@@ -392,7 +392,6 @@ class ChatModel:
         return payload
 
     async def _create(self, messages: Sequence[dict[str, Any]], tools: Sequence[dict[str, Any]] | None, stream: bool) -> Any:
-        attempt = 0
         while True:
             payload = self._payload(messages, tools, stream)
             options: dict[str, Any] = {}
@@ -408,16 +407,13 @@ class ChatModel:
                     raise AgentFailure(str(exc)) from exc
                 if tools and self.supports_tools and ("tool" in text or "function" in text or "400" in text):
                     self.supports_tools = False
-                    attempt += 1
                     continue
                 if not self.minimal and any(token in text for token in ("400", "422", "reasoning", "temperature", "top_p", "include_reasoning", "web_search", "unknown field", "unsupported")):
                     self.minimal = True
-                    attempt += 1
                     continue
                 status = getattr(exc, "status_code", None)
                 if status is not None and 400 <= int(status) < 500 and int(status) != 429:
                     raise AgentFailure(str(exc)) from exc
-                attempt += 1
                 await asyncio.sleep(2.0)
 
     async def stream_turn(self, messages: Sequence[dict[str, Any]], tools: Sequence[dict[str, Any]] | None, on_delta: Any) -> "ModelTurn":
