@@ -18,11 +18,13 @@ deploymentTarget = "autoscale"
 [userenv]
 
 [userenv.shared]
-CHAT_DEPLOYMENT_MAX_REQUEST_MS = "21744000"
-CHAT_NIXPKGS_REV = "1f607aa79b6356ed45d3cd3c8079c196e79efa2c"
-CHAT_NIX_INSTALLER_SHA256 = "69d0fe8fba8fe88f94c98b09964691ac9950abc7ecbf2ba861dc0533cfd901e9"
-CHAT_NIX_VERSION = "2.35.3"
-MODEL_API_URL = "https://api.meta.ai/v1/responses"
+ABLITERATION_BASE_URL = "https://api.abliteration.ai/v1"
+ABLITERATION_MODEL = "abliterated-model-large-flash"
+HOPPER_BASE_URL = "https://api.withhopper.com/v1"
+HOPPER_MODEL = "deepseek-v4.1-flash-1017-abliterated"
+INSTAVM_BASE_URL = "https://api.instavm.io"
+FLYMYAI_BASE_URL = "https://api.flymy.ai"
+FLYMYAI_IMAGE_MODEL = "flymyai/nano-banana-2_1"
 
 [workflows]
 runButton = "Project"

@@ -1,16 +1,35 @@
 [project]
-name = "python-template"
-version = "0.1.0"
+name = "hba"
+version = "1.0.0"
 description = ""
-authors = ["Your Name <you@example.com>"]
+authors = ["HBA"]
 requires-python = ">=3.11"
 dependencies = [
-    "fastapi==0.116.1",
-    "httpx==0.27.2",
-    "orjson==3.10.18",
-    "pydantic==2.11.7",
-    "pydantic-settings==2.10.1",
-    "python-multipart==0.0.20",
-    "uvicorn[standard]==0.34.2",
-    "websockets==13.1",
+    "fastapi>=0.116,<1",
+    "uvicorn[standard]>=0.34,<1",
+    "httpx>=0.27,<1",
+    "websockets>=12,<16",
+    "python-multipart>=0.0.20,<1",
+    "openai>=1.60,<4",
+    "instavm>=0.26,<1",
+    "browser-use>=1.0,<2",
+    "zep-cloud>=4.1,<5",
+    "pillow>=11,<13",
+    "pypdf>=5,<7",
 ]
+entrypoint = "main.py"
+modules = ["python-3.11", "nodejs-24"]
+
+[nix]
+channel = "stable-25_05"
+packages = ["libiconv", "libxcrypt"]
+
+[unitTest]
+language = "python3"
+
+[gitHubImport]
+requiredFiles = [".replit", "replit.nix"]
+
+[deployment]
+run = ["python3", "main.py"]
+deploymentTarget = "autoscale"
